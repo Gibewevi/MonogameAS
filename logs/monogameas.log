@@ -1,0 +1,4 @@
+﻿2026-01-22 00:43:41.162 [INFO] Logger initialized
+2026-01-22 00:43:41.516 [INFO] Switching to MainMenuScreen
+2026-01-22 00:43:44.335 [INFO] MainMenu: Nouvelle partie clicked
+2026-01-22 00:43:44.335 [INFO] Starting new game -> GameScreen

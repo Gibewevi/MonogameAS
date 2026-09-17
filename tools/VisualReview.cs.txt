@@ -1,0 +1,1728 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Collections;
+using System.Runtime.InteropServices;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Content;
+using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
+using MonogameAS;
+using MonogameAS.Planet;
+using MonogameAS.State;
+using MonogameAS.Systems;
+using MonogameAS.Views;
+using MonogameAS.Screens;
+
+// Compiled by Test-Visuals.ps1 in a temporary project, never into the game.
+internal static class Program
+{
+    private const int Width = 640;
+    private const int Height = 360;
+    private static readonly MouseState NoMouse = new(-10, -10, 0, ButtonState.Released,
+        ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+
+    private static int Main(string[] args)
+    {
+        var repo = Path.GetFullPath(args[0]);
+        var output = Path.GetFullPath(args[1]);
+        var binaryRoot = args.Length > 3 ? Path.GetFullPath(args[3]) : Path.Combine(repo, "bin", "Debug", "net9.0");
+        Directory.CreateDirectory(output);
+        Environment.CurrentDirectory = output;
+        // MonoGame creates SDL windows hidden; only Game.Run would show the window.
+        // See MonoGame v3.8.4.1 SDLGameWindow.CreateWindow / SDLGamePlatform.RunLoop.
+        using var game = new Game();
+        using var graphics = new GraphicsDeviceManager(game)
+        {
+            PreferredBackBufferWidth = Width,
+            PreferredBackBufferHeight = Height,
+            PreferredDepthStencilFormat = DepthFormat.None,
+            SynchronizeWithVerticalRetrace = false,
+            IsFullScreen = false
+        };
+        ((IGraphicsDeviceManager)graphics).CreateDevice();
+        var window = game.Window.Handle;
+        AssertHidden(window);
+        {
+            var device = graphics.GraphicsDevice;
+            using var batch = new SpriteBatch(device);
+            using var pixel = new Texture2D(device, 1, 1);
+            pixel.SetData(new[] { Color.White });
+            using var target = new RenderTarget2D(device, Width, Height, false, SurfaceFormat.Color,
+                DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            var services = new GameServiceContainer();
+            services.AddService(typeof(IGraphicsDeviceService), new DeviceService(device));
+            using var content = new ContentManager(services, Path.Combine(binaryRoot, "Content"));
+            var font = content.Load<SpriteFont>("Default");
+            var context = new RenderContext(device, batch, font, pixel, new Point(Width, Height));
+            context.SetDisplayTransform(1, new Rectangle(0, 0, Width, Height));
+            var report = new List<string> { "MonoGame DesktopGL GPU captures; SDL window hidden throughout." };
+            var baseline = args.Length > 2 && args[2] == "baseline";
+            var skyOnly = args.Length > 2 && args[2] == "sky";
+            var systemOnly = args.Length > 2 && args[2] == "system";
+            var planetRestoreOnly = args.Length > 2 && args[2] == "planet-restore";
+            var galaxyOnly = args.Length > 2 && args[2] is "galaxy" or "galaxy-baseline" or "galaxy-solar";
+            if (galaxyOnly) CaptureGalaxyBaseline(device, target, context, output, report);
+            if (args.Length > 2 && args[2] is "galaxy" or "galaxy-solar")
+            {
+                ValidateGalaxy(device, target, context, repo, output, report);
+                WriteGalaxyGallery(repo, output);
+            }
+            if (args.Length > 2 && args[2] == "galaxy-solar")
+                ValidateGalaxySolar(device, target, context, output, report);
+            if (!skyOnly && !systemOnly && !galaxyOnly)
+            {
+            if (!baseline) ValidateTerrain(report);
+            var cases = baseline
+                ? new[] { (987654321, PlanetPaletteType.Oceanic, SunKey.Default) }
+                : new[] {
+                    (987654321, PlanetPaletteType.Oceanic, SunKey.Default),
+                    (12345, PlanetPaletteType.Standard, new SunKey(12345, 0, 3200, 12, 4)),
+                    (42, PlanetPaletteType.Sterile, new SunKey(42, 0, 16000, 12, 4)) };
+            foreach (var (seed, palette, sun) in cases)
+            {
+                var state = new GameState();
+                state.SetPlanetKey(new PlanetKey(seed, palette, PlanetParams.Default));
+                state.SetSunKey(sun);
+                var provider = new PlanetProvider();
+                var view = new PlanetView(context, state, provider);
+                CaptureTerrainAtlas(state.PlanetKey, device, output, report);
+                CaptureTimeline(view, "planet-" + seed, device, target, context, output, report, baseline);
+                if (view is IDisposable disposable) disposable.Dispose();
+            }
+            {
+                var state = new GameState();
+                using var view = new SystemView(context, state, new PlanetProvider(), new SystemProvider(), SystemParams.Default);
+                CaptureTimeline(view, "system-default", device, target, context, output, report, baseline);
+            }
+            if (!baseline) CaptureNavigation(device, target, context, output, report);
+            if (!baseline) ValidatePlanetControls(device, target, context, output, report);
+            if (!baseline && !planetRestoreOnly) ValidateEditedWorldNavigation(context, report);
+            }
+            if (!baseline && !systemOnly && !planetRestoreOnly && !galaxyOnly) ValidatePlanetSky(device, target, context, output, report);
+            if (systemOnly)
+            {
+                ValidateSystemSky(device, target, context, output, report);
+                ValidateSolarGeneration(device, context, output, report);
+                CaptureGalaxy(device, target, context, output, report);
+                CaptureNavigation(device, target, context, output, report);
+            }
+            AssertHidden(window);
+            report.Add("PASS: SDL window stayed hidden; all frames rendered without exceptions.");
+            File.WriteAllLines(Path.Combine(output, "report.txt"), report);
+            foreach (var line in report) Console.WriteLine(line);
+            return 0;
+        }
+    }
+
+    private static void CaptureTimeline(IView view, string name, GraphicsDevice device, RenderTarget2D target,
+        RenderContext context, string output, List<string> report, bool baseline)
+    {
+        var time = 0d;
+        Color[]? firstFrame = null;
+        var changes = new List<int>();
+        var backgroundLevels = new List<double>();
+        view.Update(new GameTime(TimeSpan.Zero, TimeSpan.Zero), NoMouse, NoMouse);
+        foreach (var next in baseline ? new[] { 0d } : new[] { 0d, 12d, 30d, 60d, 120d })
+        {
+            while (time + 0.00001 < next)
+            {
+                var dt = Math.Min(1d / 10d, next - time);
+                time += dt;
+                view.Update(new GameTime(TimeSpan.FromSeconds(time), TimeSpan.FromSeconds(dt)), NoMouse, NoMouse);
+            }
+            device.SetRenderTarget(target);
+            device.Clear(Color.Black);
+            view.Draw(new GameTime(TimeSpan.FromSeconds(time), TimeSpan.Zero), context);
+            device.SetRenderTarget(null);
+            var file = name + "-t" + next.ToString("000") + ".png";
+            using (var stream = File.Create(Path.Combine(output, file))) target.SaveAsPng(stream, Width, Height);
+            var pixels = new Color[Width * Height];
+            target.GetData(pixels);
+            if (firstFrame is null) firstFrame = pixels;
+            else
+            {
+                var changed = 0;
+                for (var i = 0; i < pixels.Length; i++)
+                    if (pixels[i] != firstFrame[i]) changed++;
+                changes.Add(changed);
+            }
+            var brightness = 0d;
+            for (var y = 50; y < 300; y++)
+                for (var x = 12; x < 100; x++)
+                {
+                    var c = pixels[y * Width + x];
+                    brightness += (c.R + c.G + c.B) / 3d;
+                }
+            backgroundLevels.Add(brightness / (250 * 88));
+            report.Add("Captured " + file);
+        }
+        if (baseline) return;
+        if (!changes.Exists(n => n > 32)) throw new Exception(name + " animation did not change rendered pixels.");
+        report.Add(name + " changed pixels versus t=0: " + string.Join(", ", changes));
+        report.Add(name + " background mean brightness at capture times: " + string.Join(", ", backgroundLevels.ConvertAll(x => x.ToString("0.00"))));
+        GC.Collect();
+        var before = GC.GetAllocatedBytesForCurrentThread();
+        var timer = Stopwatch.StartNew();
+        for (var i = 0; i < 120; i++)
+        {
+            time += 1d / 60d;
+            var gameTime = new GameTime(TimeSpan.FromSeconds(time), TimeSpan.FromSeconds(1d / 60d));
+            view.Update(gameTime, NoMouse, NoMouse);
+            device.SetRenderTarget(target);
+            view.Draw(gameTime, context);
+            device.SetRenderTarget(null);
+        }
+        timer.Stop();
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+        report.Add($"{name}: CPU update+draw submission {timer.Elapsed.TotalMilliseconds / 120:0.00} ms/frame, managed allocation {allocated / 120} bytes/frame (120 frames; excludes presentation and GPU synchronization).");
+    }
+
+    private static void ValidateTerrain(List<string> report)
+    {
+        foreach (var palette in new[] { PlanetPaletteType.Oceanic, PlanetPaletteType.Standard, PlanetPaletteType.Sterile })
+        {
+            var key = new PlanetKey(987654321, palette, PlanetParams.Default);
+            var map = new PlanetWorldMap(key);
+            var copy = new PlanetWorldMap(key);
+            var anotherSeed = new PlanetWorldMap(key with { Seed = 12345 });
+            var codes = new HashSet<int>();
+            var seedDifferences = 0;
+            var longitudeDifferences = 0;
+            for (var y = 0; y < map.Height; y++)
+            {
+                for (var x = 0; x < map.Width; x++)
+                {
+                    var u = (x + 0.37f) / map.Width;
+                    var v = (y + 0.37f) / map.Height;
+                    var code = map.SampleUv(u, v);
+                    codes.Add(code);
+                    if (code is not (10 or 11 or 12 or 13 or 20 or 21)) throw new Exception("Unexpected legacy terrain code.");
+                    if (!map.Palette.HasBeaches && code == 11) throw new Exception("Sterile terrain unexpectedly contains a beach.");
+                    if (code != copy.SampleUv(u, v)) throw new Exception("Terrain generation is not deterministic.");
+                    if (code != anotherSeed.SampleUv(u, v)) seedDifferences++;
+                    if (code != map.SampleUv(u + 0.25f, v)) longitudeDifferences++;
+                    foreach (var turns in new[] { -4f, -1f, 1f, 4f })
+                        if (code != map.SampleUv(u + turns, v)) throw new Exception("Longitude failed to wrap.");
+                    var longitude = (u - 0.5f) * MathHelper.TwoPi;
+                    var latitude = (0.5f - v) * MathHelper.Pi;
+                    foreach (var turns in new[] { -2f, -1f, 0f, 1f, 2f })
+                        if (code != map.Sample(longitude + turns * MathHelper.TwoPi, latitude))
+                            throw new Exception("Full spherical rotation did not return to the same terrain.");
+                    if (map.ColorFor(code).A != 255) throw new Exception("Terrain contains a transparent hole.");
+                }
+            }
+            foreach (var latitude in new[] { -MathHelper.PiOver2, MathHelper.PiOver2 })
+                for (var x = -20; x <= 20; x++)
+                    if (map.ColorFor(map.Sample(x * 1.13f, latitude)).A != 255)
+                        throw new Exception("Invalid polar sample.");
+            if (codes.Count < 3 || seedDifferences < map.Width * map.Height / 20 || longitudeDifferences < map.Width * map.Height / 20)
+                throw new Exception("Terrain variation is insufficient.");
+            report.Add($"PASS {palette}: {map.Width}x{map.Height} stable atlas; {codes.Count} terrain codes; deterministic generation, seed variation, full longitude wrapping including negative turns, valid poles, opaque terrain.");
+        }
+    }
+
+    private static void CaptureTerrainAtlas(PlanetKey key, GraphicsDevice device, string output, List<string> report)
+    {
+        var world = new PlanetWorldMap(key);
+        var pixels = new Color[world.Width * world.Height];
+        var basename = $"atlas-{key.Seed}-{key.Palette}";
+        // Stable fixture bytes permit direct comparison with a retained pre-redesign
+        // assembly without encoding the generator's algorithm in this harness.
+        using (var stream = File.Create(Path.Combine(output, basename + ".bin")))
+        using (var writer = new BinaryWriter(stream))
+        {
+            writer.Write(world.Width);
+            writer.Write(world.Height);
+            for (var y = 0; y < world.Height; y++)
+                for (var x = 0; x < world.Width; x++)
+                {
+                    var code = world.SampleUv((x + .37f) / world.Width, (y + .37f) / world.Height);
+                    var color = world.ColorFor(code);
+                    pixels[y * world.Width + x] = color;
+                    writer.Write(code);
+                    writer.Write(color.PackedValue);
+                }
+        }
+        using var texture = new Texture2D(device, world.Width, world.Height);
+        texture.SetData(pixels);
+        using var image = File.Create(Path.Combine(output, basename + ".png"));
+        texture.SaveAsPng(image, world.Width, world.Height);
+        report.Add($"Captured {basename}: {world.Width}x{world.Height} terrain codes and palette colors.");
+    }
+
+    private static void CaptureNavigation(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string output, List<string> report)
+    {
+        var screen = new GameScreen(context);
+        PlanetKey? selectedPlanet = null;
+        try
+        {
+            foreach (var (x, name) in new[] { (190, "system"), (320, "planet") })
+            {
+                var click = new MouseState(x, 22, 0, ButtonState.Pressed, ButtonState.Released,
+                    ButtonState.Released, ButtonState.Released, ButtonState.Released);
+                var time = new GameTime(TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(1d / 60));
+                screen.Update(time, click, NoMouse);
+                screen.Update(time, NoMouse, click);
+                var state = (GameState)typeof(GameScreen).GetField("_state", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(screen)!;
+                var expected = name == "system" ? ViewMode.System : ViewMode.Planet;
+                if (state.CurrentView != expected) throw new Exception("View navigation failed: " + name);
+                if (name == "planet" && selectedPlanet.HasValue && state.PlanetKey != selectedPlanet.Value)
+                    throw new Exception("Planet navigation changed the selected terrain.");
+                device.SetRenderTarget(target);
+                device.Clear(Color.Black);
+                screen.Draw(time);
+                device.SetRenderTarget(null);
+                var file = "navigation-" + name + ".png";
+                using var stream = File.Create(Path.Combine(output, file));
+                target.SaveAsPng(stream, Width, Height);
+                report.Add("Captured " + file + " through GameScreen tab click.");
+                if (name == "system")
+                {
+                    var current = typeof(GameScreen).GetField("_currentView", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(screen)!;
+                    var positions = (IEnumerable)typeof(SystemView).GetField("_planetScreen", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(current)!;
+                    var tested = false;
+                    foreach (var entry in positions)
+                    {
+                        var position = (Vector2)entry.GetType().GetField("Item2")!.GetValue(entry)!;
+                        if (position.Y < 55 || position.Y > Height - 30) continue;
+                        var orbital = (PlanetOrbital)entry.GetType().GetField("Item1")!.GetValue(entry)!;
+                        var selection = new MouseState((int)MathF.Round(position.X), (int)MathF.Round(position.Y), 0,
+                            ButtonState.Pressed, ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+                        screen.Update(time, selection, NoMouse);
+                        if (state.PlanetKey != orbital.PlanetKey) throw new Exception("System planet selection no longer selects the clicked territory.");
+                        selectedPlanet = state.PlanetKey;
+                        screen.Update(time, NoMouse, selection);
+                        tested = true;
+                        break;
+                    }
+                    if (!tested) throw new Exception("No visible system planet was available for selection validation.");
+                    report.Add("PASS: clicking a system planet preserves its seed, palette and terrain parameters when opening Planet view.");
+                }
+            }
+        }
+        finally
+        {
+            if (screen is IDisposable disposable) disposable.Dispose();
+        }
+    }
+
+    private static void ValidatePlanetControls(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string output, List<string> report)
+    {
+        var state = new GameState();
+        using var view = new PlanetView(context, state, new PlanetProvider());
+        var time = new GameTime(TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(1d / 60));
+        view.Update(time, NoMouse, NoMouse);
+        var setKeys = typeof(Keyboard).GetMethod("SetKeys", BindingFlags.Static | BindingFlags.NonPublic)!;
+        setKeys.Invoke(null, new object[] { new List<Keys> { Keys.F3 } });
+        view.Update(time, NoMouse, NoMouse);
+        setKeys.Invoke(null, new object[] { new List<Keys>() });
+        view.Update(time, NoMouse, NoMouse);
+        if (!(bool)Field(view, "_showDebug")) throw new Exception("F3 did not reveal planet controls.");
+        SaveView("planet-debug-controls.png");
+        var renderer = Field(view, "_planet");
+        ClickSlider("Rings", 0);
+        ClickSlider("Moons", 0);
+        if (Property(renderer, "RingCount") != 0 || Property(renderer, "MoonCount") != 0)
+            throw new Exception("Ring/moon controls failed to hide decorations.");
+        ClickSlider("Clip", 0);
+        if ((bool)Field(renderer, "_clip")) throw new Exception("Clip control did not reveal the full map.");
+        var squarePixels = (Color[])Field(Field(renderer, "_surface"), "Pixels");
+        if (squarePixels[0].A == 0 || squarePixels[^1].A == 0) throw new Exception("Unclipped terrain has missing corners.");
+        SaveView("planet-debug-map.png");
+        ClickSlider("Clip", 1);
+        ClickSlider("Rings", 1);
+        ClickSlider("Moons", 1);
+        if (Property(renderer, "RingCount") != 3 || Property(renderer, "MoonCount") != 3)
+            throw new Exception("Ring/moon controls failed to display three decorations.");
+        SaveView("planet-debug-three-rings-moons.png");
+
+        // Isolate the actual GPU terrain layer: fixed lighting, no clouds or rings.
+        // A complete revolution must return every pixel to the original territory.
+        var update = renderer.GetType().GetMethod("Update")!;
+        Color[] SurfaceAt(double seconds)
+        {
+            update.Invoke(renderer, new object[] { state.PlanetKey, new Point(Width, 340), seconds,
+                Vector3.Normalize(new Vector3(.7f, -.3f, .6f)), Color.White, true, false, false, 0, 0 });
+            var texture = (Texture2D)Field(Field(renderer, "_surface"), "Texture");
+            var pixels = new Color[texture.Width * texture.Height];
+            texture.GetData(pixels);
+            return pixels;
+        }
+        var initial = SurfaceAt(0);
+        const double period = 84;
+        var quarter = SurfaceAt(period / 4d);
+        var complete = SurfaceAt(period);
+        var moved = 0;
+        for (var i = 0; i < initial.Length; i++)
+        {
+            if (initial[i] != quarter[i]) moved++;
+            if (initial[i] != complete[i]) throw new Exception("Terrain GPU pixels changed after a complete revolution.");
+        }
+        if (moved < initial.Length / 20) throw new Exception("Terrain does not move during the quarter revolution.");
+        report.Add($"PASS: F3, actual Rings/Moons/Clip slider clicks, 0/3 decorations, full map corners; GPU surface quarter-turn changes {moved} pixels and full {period:0.00}-second revolution is pixel-identical with fixed lighting.");
+
+        void SaveView(string name)
+        {
+            device.SetRenderTarget(target);
+            device.Clear(Color.Black);
+            view.Draw(time, context);
+            device.SetRenderTarget(null);
+            using var stream = File.Create(Path.Combine(output, name));
+            target.SaveAsPng(stream, Width, Height);
+            report.Add("Captured " + name);
+        }
+
+        void ClickSlider(string label, float fraction)
+        {
+            var sliders = (IList)Field(view, "_planetSliders");
+            var index = -1;
+            for (var i = 0; i < sliders.Count; i++)
+                if ((string)sliders[i]!.GetType().GetProperty("Label")!.GetValue(sliders[i])! == label) index = i;
+            if (index < 0) throw new Exception("Missing slider " + label);
+            var height = (int)view.GetType().GetMethod("GetDebugPanelHeight", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(view, null)!;
+            var rows = (sliders.Count + 1) / 2;
+            const int columnWidth = (Width - 16 - 12 - 8) / 2;
+            var row = new Rectangle(14 + index / rows * (columnWidth + 8), Height - height + 38 + index % rows * 20, columnWidth, 20);
+            var track = (Rectangle)sliders[index]!.GetType().GetMethod("MakeTrackRect")!.Invoke(null, new object[] { row, 60, 32 })!;
+            var mouse = new MouseState(track.X + (int)((track.Width - 1) * fraction), track.Center.Y, 0,
+                ButtonState.Pressed, ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+            view.Update(time, mouse, NoMouse);
+            view.Update(time, NoMouse, mouse);
+        }
+    }
+
+    private static object Field(object value, string name) => value.GetType()
+        .GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(value)!;
+    private static int Property(object value, string name) => (int)value.GetType().GetProperty(name)!.GetValue(value)!;
+
+    private static void ValidatePlanetSky(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string output, List<string> report)
+    {
+        var state = new GameState();
+        // Changing temperature alone must change the sky immediately: seed, planet
+        // territory and animation time deliberately stay identical.
+        var warmKey = new SunKey(123456789, 0, 3200, 12, 4);
+        var coldKey = warmKey with { Celsus = 16000 };
+        state.SetSunKey(warmKey);
+        using var view = new PlanetView(context, state, new PlanetProvider());
+        var warmZero = Capture("sky-warm-t000", 0);
+        state.SetSunKey(coldKey);
+        var coldZero = Capture("sky-cold-t000", 0);
+        var changed = 0;
+        var samples = 0;
+        for (var y = 60; y < 300; y++)
+            for (var x = 12; x < 100; x++)
+            {
+                if (warmZero[y * Width + x] != coldZero[y * Width + x]) changed++;
+                samples++;
+            }
+        var warmRgb = MeanSky(warmZero);
+        var coldRgb = MeanSky(coldZero);
+        if (changed < samples / 2 || Vector3.Distance(warmRgb, coldRgb) < 5f)
+            throw new Exception("Solar temperature did not visibly change the sky immediately at the same seed and time.");
+        if (warmRgb.X - warmRgb.Z < coldRgb.X - coldRgb.Z + 5f)
+            throw new Exception("Sky hue does not follow the warm/cold solar palette.");
+        report.Add($"PASS: same planet, sun seed and t=0; changing only solar temperature updates {changed}/{samples} sampled sky pixels immediately; mean RGB warm={warmRgb}, cold={coldRgb}.");
+
+        var dayColors = new Dictionary<string, Vector3>();
+        foreach (var seconds in new[] { 36, 148 })
+        foreach (var (name, key) in new[] { ("warm", warmKey), ("cold", coldKey) })
+        {
+            state.SetSunKey(key);
+            var pixels = Capture("sky-" + name + (seconds == 36 ? "-t036-day" : "-t148-night"), seconds);
+            var rgb = MeanSky(pixels);
+            if (seconds == 36) { dayColors[name] = rgb; continue; }
+            var dayRgb = dayColors[name];
+            var nightRgb = rgb;
+            if (Vector3.Distance(dayRgb, nightRgb) < 5f)
+                throw new Exception("Planet sky does not visibly respond to the day/night cycle.");
+            report.Add($"PASS: {name} sky day RGB={dayRgb}; night RGB={nightRgb}.");
+        }
+
+        using (var sunTarget = new RenderTarget2D(device, 32, 24, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.PreserveContents))
+        {
+            device.SetRenderTarget(sunTarget);
+            device.Clear(Color.Transparent);
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            var sun = Field(view, "_sun");
+            sun.GetType().GetMethod("DrawDistant")!.Invoke(sun,
+                new object[] { context.SpriteBatch, context.Pixel, new Vector2(16, 12) });
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            var pixels = new Color[32 * 24];
+            sunTarget.GetData(pixels);
+            var core = Bounds(128);
+            var halo = Bounds(1);
+            if (core.Width < 1 || core.Width > 5 || core.Height < 1 || core.Height > 4)
+                throw new Exception("Distant solar core exceeded its five-by-four-pixel limit.");
+            if (halo.Width > 9 || halo.Height > 8)
+                throw new Exception("Distant solar halo is too large.");
+            using var stream = File.Create(Path.Combine(output, "sun-distant-isolated.png"));
+            sunTarget.SaveAsPng(stream, 32, 24);
+            report.Add($"PASS: distant sun GPU alpha bounds core={core.Width}x{core.Height}, halo={halo.Width}x{halo.Height} logical pixels.");
+
+            Rectangle Bounds(int minimumAlpha)
+            {
+                var minX = 32; var minY = 24; var maxX = -1; var maxY = -1;
+                for (var y = 0; y < 24; y++)
+                    for (var x = 0; x < 32; x++)
+                        if (pixels[y * 32 + x].A >= minimumAlpha)
+                        {
+                            minX = Math.Min(minX, x); minY = Math.Min(minY, y);
+                            maxX = Math.Max(maxX, x); maxY = Math.Max(maxY, y);
+                        }
+                return maxX < minX ? Rectangle.Empty : new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+            }
+        }
+
+        Color[] Capture(string name, double seconds)
+        {
+            var time = new GameTime(TimeSpan.FromSeconds(seconds), TimeSpan.Zero);
+            view.Update(time, NoMouse, NoMouse);
+            device.SetRenderTarget(target);
+            device.Clear(Color.Black);
+            view.Draw(time, context);
+            device.SetRenderTarget(null);
+            using (var stream = File.Create(Path.Combine(output, name + ".png")))
+                target.SaveAsPng(stream, Width, Height);
+            var pixels = new Color[Width * Height];
+            target.GetData(pixels);
+            report.Add("Captured " + name + ".png");
+            return pixels;
+        }
+
+        static Vector3 MeanSky(Color[] pixels)
+        {
+            var sum = Vector3.Zero;
+            for (var y = 60; y < 300; y++)
+                for (var x = 12; x < 100; x++)
+                {
+                    var color = pixels[y * Width + x];
+                    sum += new Vector3(color.R, color.G, color.B);
+                }
+            return sum / (240 * 88);
+        }
+    }
+
+    private static void ValidateSystemSky(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string output, List<string> report)
+    {
+        var initialSkies = new Dictionary<string, Color[]>();
+        foreach (var (name, temperature) in new[] { ("warm", 3200), ("cold", 16000), ("green", 9000) })
+        {
+            var state = new GameState();
+            state.SetSunKey(new SunKey(123456789, 0, temperature, 12, 4));
+            using var view = new SystemView(context, state, new PlanetProvider(), new SystemProvider(), SystemParams.Default);
+            Color[]? initialNebula = null;
+            foreach (var seconds in new[] { 0, 30, 90 })
+            {
+                var time = new GameTime(TimeSpan.FromSeconds(seconds), TimeSpan.Zero);
+                view.Update(time, NoMouse, NoMouse);
+                device.SetRenderTarget(target);
+                device.Clear(Color.Black);
+                view.Draw(time, context);
+                device.SetRenderTarget(null);
+                var filename = $"system-{name}-t{seconds:000}.png";
+                using (var stream = File.Create(Path.Combine(output, filename))) target.SaveAsPng(stream, Width, Height);
+                report.Add("Captured " + filename);
+
+                // Read only the retained background texture: it contains no moving
+                // stars, sun, orbital bodies or HUD, and solar lighting stays fixed.
+                var texture = (Texture2D)Field(Field(view, "_backdrop"), "_texture");
+                var nebula = ReadTexture(texture);
+                if (initialNebula is null)
+                {
+                    initialNebula = nebula;
+                    initialSkies[name] = nebula;
+                    ValidateSystemSun(Field(view, "_sun"), 48, name == "warm");
+                    ValidateSystemPlanetPixels(view, device, context, report);
+                }
+                else
+                {
+                    var changed = Differences(initialNebula, nebula);
+                    if (changed < nebula.Length / 100)
+                        throw new Exception("Procedural system nebula did not animate under fixed solar lighting.");
+                    report.Add($"PASS: {name} background texture alone changes {changed}/{nebula.Length} pixels at t={seconds}; fixed seed, solar colour and solar position.");
+                }
+                using (var stream = File.Create(Path.Combine(output, $"nebula-{name}-t{seconds:000}.png")))
+                    texture.SaveAsPng(stream, texture.Width, texture.Height);
+            }
+
+            // Same time and inputs reproduce the same procedural cloud texture.
+            var backdrop = Field(view, "_backdrop");
+            var sun = Field(view, "_sun");
+            var light = (Color)sun.GetType().GetProperty("LightColor")!.GetValue(sun)!;
+            backdrop.GetType().GetMethod("Update")!.Invoke(backdrop,
+                new object[] { 0d, light, new Vector2(Width / 2, Height / 2), 1f });
+            if (Differences(initialNebula!, ReadTexture((Texture2D)Field(backdrop, "_texture"))) != 0)
+                throw new Exception("Procedural nebula changed at identical animation time.");
+            report.Add("PASS: " + name + " nebula reproduces its original texture at t=0.");
+
+            GC.Collect();
+            var before = GC.GetAllocatedBytesForCurrentThread();
+            var timer = Stopwatch.StartNew();
+            for (var i = 1; i <= 120; i++)
+            {
+                var time = new GameTime(TimeSpan.FromSeconds(90 + i / 60d), TimeSpan.FromSeconds(1d / 60));
+                view.Update(time, NoMouse, NoMouse);
+                device.SetRenderTarget(target);
+                view.Draw(time, context);
+                device.SetRenderTarget(null);
+            }
+            timer.Stop();
+            var allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+            report.Add($"System {name}: CPU update+draw submission {timer.Elapsed.TotalMilliseconds / 120:0.00} ms/frame; {allocated / 120} managed bytes/frame (120 frames, excluding presentation/GPU synchronization).");
+        }
+
+        foreach (var comparison in new[] { "cold", "green" })
+        {
+            var changed = Differences(initialSkies["warm"], initialSkies[comparison]);
+            var first = Mean(initialSkies["warm"]);
+            var second = Mean(initialSkies[comparison]);
+            if (changed < initialSkies["warm"].Length / 2 || Vector3.Distance(first, second) < 1.5f)
+                throw new Exception("System nebula tint does not visibly follow the solar palette at identical seed/time.");
+            report.Add($"PASS: same seed/time warm vs {comparison}: {changed} background pixels change; mean RGB {first} vs {second}.");
+        }
+
+        var maximumState = new GameState();
+        maximumState.SetSunKey(new SunKey(123456789, 0, 3200, 32, 4));
+        using var maximumView = new SystemView(context, maximumState, new PlanetProvider(), new SystemProvider(), SystemParams.Default);
+        maximumView.Update(new GameTime(TimeSpan.Zero, TimeSpan.Zero), NoMouse, NoMouse);
+        ValidateSystemSun(Field(maximumView, "_sun"), 128, true);
+
+        void ValidateSystemSun(object sun, int diameter, bool capture)
+        {
+            var cell = (int)Field(sun, "_cellSize");
+            var actualDiameter = (int)Field(sun, "_diameter");
+            var surface = (Texture2D)Field(sun, "_surface");
+            if (cell != 2 || actualDiameter != diameter || surface.Width * cell != diameter)
+                throw new Exception("System sun lost its original diameter or does not use two-pixel cells.");
+            using var isolated = new RenderTarget2D(device, 160, 160, false, SurfaceFormat.Color,
+                DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            device.SetRenderTarget(isolated);
+            device.Clear(Color.Transparent);
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            sun.GetType().GetMethod("Draw")!.Invoke(sun,
+                new object[] { context.SpriteBatch, context.Pixel, new Vector2(80, 80), 1f });
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            // Prominences may be opaque beyond the limb: measure the body layer
+            // independently rather than constraining the artistic flare geometry.
+            using var body = new RenderTarget2D(device, 160, 160, false, SurfaceFormat.Color,
+                DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            device.SetRenderTarget(body);
+            device.Clear(Color.Transparent);
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            context.SpriteBatch.Draw(surface, new Rectangle(80 - diameter / 2, 80 - diameter / 2, diameter, diameter), Color.White);
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            var pixels = ReadTexture(body);
+            var minX = 160; var minY = 160; var maxX = -1; var maxY = -1;
+            for (var y = 0; y < 160; y++)
+                for (var x = 0; x < 160; x++)
+                    if (pixels[y * 160 + x].A >= 250)
+                    {
+                        minX = Math.Min(minX, x); minY = Math.Min(minY, y);
+                        maxX = Math.Max(maxX, x); maxY = Math.Max(maxY, y);
+                    }
+            if (maxX - minX + 1 != diameter || maxY - minY + 1 != diameter)
+                throw new Exception("Rendered system sun changed its opaque diameter.");
+            if (capture)
+            {
+                using var stream = File.Create(Path.Combine(output, $"sun-system-isolated-{diameter:000}.png"));
+                isolated.SaveAsPng(stream, 160, 160);
+            }
+            report.Add($"PASS: system solar core {diameter}x{diameter} GPU pixels; cell={cell} logical pixel(s); surface texture={surface.Width}x{surface.Height}.");
+        }
+
+        static Color[] ReadTexture(Texture2D texture)
+        {
+            var pixels = new Color[texture.Width * texture.Height];
+            texture.GetData(pixels);
+            return pixels;
+        }
+        static int Differences(Color[] first, Color[] second)
+        {
+            var changed = 0;
+            for (var i = 0; i < first.Length; i++) if (first[i] != second[i]) changed++;
+            return changed;
+        }
+        static Vector3 Mean(Color[] pixels)
+        {
+            var total = Vector3.Zero;
+            foreach (var color in pixels) total += new Vector3(color.R, color.G, color.B);
+            return total / pixels.Length;
+        }
+    }
+
+    private static void ValidateSystemPlanetPixels(SystemView view, GraphicsDevice device, RenderContext context, List<string> report)
+    {
+        var cell = (int)typeof(SystemView).GetField("SystemPlanetCellSize", BindingFlags.NonPublic | BindingFlags.Static)!.GetRawConstantValue()!;
+        if (cell != 2) throw new Exception("System planet cells must match the two-pixel solar grid.");
+        var cache = (IDictionary)Field(view, "_planetCache");
+        var count = 0;
+        foreach (var entry in (IEnumerable)Field(view, "_planetScreen"))
+        {
+            var orbital = (PlanetOrbital)Field(entry, "Item1");
+            var texture = (Texture2D)cache[orbital.PlanetKey.Seed]!.GetType().GetProperty("Texture")!.GetValue(cache[orbital.PlanetKey.Seed])!;
+            var diameter = texture.Width * cell;
+            var hitRadius = (float)Field(entry, "Item3");
+            if (Math.Abs(hitRadius - diameter / 2f) > .01f) throw new Exception("Planet selection radius disagrees with its rendered diameter.");
+            using var isolated = new RenderTarget2D(device, diameter, diameter, false, SurfaceFormat.Color,
+                DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            device.SetRenderTarget(isolated);
+            device.Clear(Color.Transparent);
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            context.SpriteBatch.Draw(texture, new Rectangle(0, 0, diameter, diameter), Color.White);
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            var pixels = new Color[diameter * diameter];
+            isolated.GetData(pixels);
+            AssertTwoPixelBlocks(pixels, diameter, diameter);
+            count++;
+        }
+        if (count == 0) throw new Exception("No planet miniature was tested.");
+        report.Add($"PASS: {count} GPU planet miniatures use uniform 2x2 pixel blocks and matching selection radii.");
+    }
+
+    private static void AssertTwoPixelBlocks(Color[] pixels, int width, int height, int offsetX = 0, int offsetY = 0)
+    {
+        for (var y = offsetY; y + 1 < height; y += 2)
+            for (var x = offsetX; x + 1 < width; x += 2)
+            {
+                var c = pixels[y * width + x];
+                if (c != pixels[y * width + x + 1] || c != pixels[(y + 1) * width + x] || c != pixels[(y + 1) * width + x + 1])
+                    throw new Exception("GPU rendering introduced pixels finer than the shared 2x2 cell grid.");
+            }
+    }
+
+    private static void ValidateSolarGeneration(GraphicsDevice device, RenderContext context, string output, List<string> report)
+    {
+        var type = typeof(SystemView).Assembly.GetType("MonogameAS.Galaxy.PixelSunRenderer")!;
+        foreach (var (name, temperature) in new[] { ("warm", 3200), ("cold", 16000), ("green", 9000) })
+        {
+            var key = new SunKey(123456789, 0, temperature, 12, 4);
+            var sun = Activator.CreateInstance(type, device, key, 48, 2)!;
+            var large = Activator.CreateInstance(type, device, key, 128, 2)!;
+            try
+            {
+                var light = (Color)type.GetProperty("LightColor")!.GetValue(sun)!;
+                if (light != (Color)type.GetProperty("LightColor")!.GetValue(large)!)
+                    throw new Exception("Solar palette depends on the display resolution.");
+                var frames = new Dictionary<double, Color[]>();
+                foreach (var seconds in new[] { 0d, .1d, 2d, 8d, 20d })
+                {
+                    type.GetMethod("Update")!.Invoke(sun, new object[] { seconds });
+                    var texture = (Texture2D)Field(sun, "_surface");
+                    var pixels = new Color[texture.Width * texture.Height];
+                    texture.GetData(pixels);
+                    frames[seconds] = pixels;
+                    for (var y = 0; y < texture.Height; y++)
+                        for (var x = 0; x < texture.Width; x++)
+                        {
+                            var nx = (x + .5f) * 2f / texture.Width - 1;
+                            var ny = (y + .5f) * 2f / texture.Height - 1;
+                            if (pixels[y * texture.Width + x].A != (nx * nx + ny * ny <= 1 ? 255 : 0))
+                                throw new Exception("Solar surface must be a completely opaque cellular circle without holes.");
+                        }
+                    if (seconds != .1) CaptureSun($"solar-{name}-t{seconds:000}.png", sun, texture);
+                }
+                var shortDelta = MeanDelta(frames[0], frames[.1]);
+                var longDelta = MeanDelta(frames[0], frames[8]);
+                var moved = 0;
+                for (var i = 0; i < frames[0].Length; i++) if (frames[0][i] != frames[8][i]) moved++;
+                if (longDelta < 2 || moved < frames[0].Length / 12)
+                    throw new Exception("Solar plasma does not visibly evolve across the cellular surface.");
+                if (shortDelta > longDelta * .60f + .5f)
+                    report.Add("REVIEW: solar short-interval colour change is high relative to the 8-second evolution; inspect the timeline for flicker.");
+
+                foreach (var seconds in new[] { -4d, 1_000_000d })
+                {
+                    type.GetMethod("Update")!.Invoke(sun, new object[] { seconds });
+                    CaptureSun(null, sun, (Texture2D)Field(sun, "_surface"));
+                }
+                type.GetMethod("Update")!.Invoke(sun, new object[] { 0d });
+                var resetTexture = (Texture2D)Field(sun, "_surface");
+                var reset = new Color[resetTexture.Width * resetTexture.Height];
+                resetTexture.GetData(reset);
+                if (MeanDelta(frames[0], reset) != 0) throw new Exception("Solar generation is not deterministic at the same seed and time.");
+                report.Add($"PASS: {name} solar palette identical at 48/128 pixels; opaque circle; 2x2 GPU cells; {moved} surface cells change at 8s; mean RGB delta at 0.1s={shortDelta:0.00}, at 8s={longDelta:0.00}; negative/long times render safely; reproducible t=0.");
+            }
+            finally { ((IDisposable)sun).Dispose(); ((IDisposable)large).Dispose(); }
+        }
+        File.WriteAllText(Path.Combine(output, "solar-review.html"),
+            "<!doctype html><meta charset='utf-8'><title>Solar generation review</title><style>body{background:#0c0c12;color:#ddd;font:16px sans-serif;margin:24px}section{display:flex;gap:12px}img{width:240px;height:240px;image-rendering:pixelated}figure{margin:0}h2{font-weight:normal}</style>" +
+            string.Join("", Array.ConvertAll(new[] { "warm", "cold", "green" }, name => "<h2>" + name + "</h2><section>" +
+                string.Join("", Array.ConvertAll(new[] { 0, 2, 8, 20 }, seconds => $"<figure><img src='solar-{name}-t{seconds:000}.png'><figcaption>{seconds} s</figcaption></figure>")) + "</section>")));
+
+        void CaptureSun(string? filename, object sun, Texture2D surface)
+        {
+            using var enlarged = new RenderTarget2D(device, 48, 48, false, SurfaceFormat.Color,
+                DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            device.SetRenderTarget(enlarged);
+            device.Clear(Color.Transparent);
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            context.SpriteBatch.Draw(surface, new Rectangle(0, 0, 48, 48), Color.White);
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            var pixels = new Color[48 * 48];
+            enlarged.GetData(pixels);
+            AssertTwoPixelBlocks(pixels, 48, 48);
+            using var target = new RenderTarget2D(device, 80, 80, false, SurfaceFormat.Color,
+                DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+            device.SetRenderTarget(target);
+            device.Clear(new Color(8, 8, 13));
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            type.GetMethod("Draw")!.Invoke(sun, new object[] { context.SpriteBatch, context.Pixel, new Vector2(40, 40), 1f });
+            type.GetMethod("DrawDistant")!.Invoke(sun, new object[] { context.SpriteBatch, context.Pixel, new Vector2(8, 8) });
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            if (filename is not null)
+            {
+                using var stream = File.Create(Path.Combine(output, filename));
+                target.SaveAsPng(stream, 80, 80);
+            }
+        }
+
+        static float MeanDelta(Color[] a, Color[] b)
+        {
+            var total = 0f; var count = 0;
+            for (var i = 0; i < a.Length; i++)
+                if (a[i].A != 0)
+                {
+                    total += (Math.Abs(a[i].R - b[i].R) + Math.Abs(a[i].G - b[i].G) + Math.Abs(a[i].B - b[i].B)) / 3f;
+                    count++;
+                }
+            return total / Math.Max(1, count);
+        }
+    }
+
+    private static void CaptureGalaxy(GraphicsDevice device, RenderTarget2D target, RenderContext context, string output, List<string> report)
+    {
+        var state = new GameState();
+        using var view = new GalaxyView(context, state, state.SetSunKey);
+        var time = new GameTime(TimeSpan.Zero, TimeSpan.Zero);
+        view.Update(time, NoMouse, NoMouse);
+        device.SetRenderTarget(target);
+        device.Clear(Color.Black);
+        view.Draw(time, context);
+        device.SetRenderTarget(null);
+        using var stream = File.Create(Path.Combine(output, "galaxy-new-suns.png"));
+        target.SaveAsPng(stream, Width, Height);
+        report.Add("Captured galaxy-new-suns.png through GalaxyView and the regenerated SunGenerator bake.");
+    }
+
+    private static void CaptureGalaxyBaseline(GraphicsDevice device, RenderTarget2D target, RenderContext context, string output, List<string> report)
+    {
+        using var screen = new GameScreen(context);
+        var time = new GameTime(TimeSpan.FromSeconds(8), TimeSpan.FromSeconds(1d / 60));
+        screen.Update(time, NoMouse, NoMouse);
+        var view = (GalaxyView)Field(screen, "_currentView");
+        device.SetRenderTarget(target);
+        device.Clear(Color.Black);
+        screen.Draw(time);
+        device.SetRenderTarget(null);
+        using (var stream = File.Create(Path.Combine(output, "galaxy-overview.png"))) target.SaveAsPng(stream, Width, Height);
+        var manifest = GalaxyManifest(view);
+        File.WriteAllLines(Path.Combine(output, "galaxy-world.txt"), manifest);
+        report.Add("Captured galaxy-overview.png through GameScreen, plus exact initial system positions and SunKeys in galaxy-world.txt.");
+    }
+
+    private static List<string> GalaxyManifest(GalaxyView view)
+    {
+        var manifest = new List<string>();
+        var tiles = (IDictionary)Field(view, "_tiles");
+        foreach (DictionaryEntry entry in tiles)
+        {
+            var tile = entry.Value!;
+            var coords = (Point)tile.GetType().GetProperty("Coords")!.GetValue(tile)!;
+            var suns = (List<Vector2>)tile.GetType().GetProperty("SunsLocal")!.GetValue(tile)!;
+            for (var index = 0; index < suns.Count; index++)
+            {
+                var world = coords.ToVector2() * 32 + suns[index];
+                var seed = (int)typeof(GalaxyView).GetMethod("SeedFromPoint", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { world })!;
+                var classId = (int)typeof(GalaxyView).GetMethod("ClassFromSeed", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { seed })!;
+                manifest.Add(FormattableString.Invariant($"tile={coords.X},{coords.Y}; star={index}; x={world.X:R}; y={world.Y:R}; seed={seed}; class={classId}"));
+            }
+        }
+        manifest.Sort(StringComparer.Ordinal);
+        return manifest;
+    }
+
+    private static void ValidateGalaxy(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string repo, string output, List<string> report)
+    {
+        using var screen = new GameScreen(context);
+        var state = (GameState)Field(screen, "_state");
+        var view = (GalaxyView)Field(screen, "_currentView");
+        var hud = Field(view, "_hud");
+        var hudType = hud.GetType();
+        Rectangle Bounds(string name) => (Rectangle)hudType.GetProperty(name,
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)!.GetValue(hud)!;
+        var map = Bounds("MapBounds");
+        var now = 8d;
+        var keys = typeof(Keyboard).GetMethod("SetKeys", BindingFlags.Static | BindingFlags.NonPublic)!;
+        var emptyKeys = new List<Keys>();
+        void SetKeys(params Keys[] held) => keys.Invoke(null, new object[] { new List<Keys>(held) });
+        MouseState Pointer(Point point, bool pressed = false, int wheel = 0) => new(point.X, point.Y, wheel,
+            pressed ? ButtonState.Pressed : ButtonState.Released, ButtonState.Released,
+            ButtonState.Released, ButtonState.Released, ButtonState.Released);
+        void Frame(MouseState mouse, MouseState previous, double dt = 1d / 60)
+        {
+            now += dt;
+            var time = new GameTime(TimeSpan.FromSeconds(now), TimeSpan.FromSeconds(dt));
+            screen.Update(time, mouse, previous);
+            device.SetRenderTarget(target);
+            device.Clear(Color.Black);
+            screen.Draw(time);
+            device.SetRenderTarget(null);
+        }
+        void Capture(string name)
+        {
+            using var stream = File.Create(Path.Combine(output, name + ".png"));
+            target.SaveAsPng(stream, Width, Height);
+            report.Add("Captured " + name + ".png");
+        }
+        void Click(Point point)
+        {
+            var released = Pointer(point);
+            var pressed = Pointer(point, true);
+            Frame(pressed, released);
+            Frame(released, pressed);
+        }
+        Vector2 Camera() => (Vector2)Field(view, "_cameraPos");
+        void SetCamera(Vector2 position) => typeof(GalaxyView).GetField("_cameraPos", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(view, position);
+        float Zoom() => (float)typeof(GalaxyView).GetProperty("CurrentZoom", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(view)!;
+        Vector2 World(Point point) => (Vector2)typeof(GalaxyView).GetMethod("ScreenToWorld", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(view, new object[] { point })!;
+        Point Screen(Vector2 world)
+        {
+            var matrix = (Matrix)typeof(GalaxyView).GetMethod("BuildCameraMatrix", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(view, new object[] { context.ViewSize })!;
+            var point = Vector2.Transform(world, matrix);
+            return new Point((int)MathF.Round(point.X), (int)MathF.Round(point.Y));
+        }
+        int TileCount() => ((IDictionary)Field(view, "_tiles")).Count;
+        (Vector2 World, int Seed, int Class, int Size) FirstVisibleStar(int? excludeSeed = null)
+        {
+            foreach (DictionaryEntry entry in (IDictionary)Field(view, "_tiles"))
+            {
+                var tile = entry.Value!;
+                var coords = (Point)tile.GetType().GetProperty("Coords")!.GetValue(tile)!;
+                var suns = (List<Vector2>)tile.GetType().GetProperty("SunsLocal")!.GetValue(tile)!;
+                foreach (var local in suns)
+                {
+                    var world = coords.ToVector2() * 32 + local;
+                    var point = Screen(world);
+                    if (point.X < map.Left + 20 || point.X > map.Right - 20 || point.Y < map.Top + 20 || point.Y > map.Bottom - 20) continue;
+                    var seed = (int)typeof(GalaxyView).GetMethod("SeedFromPoint", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, new object[] { world })!;
+                    if (seed == excludeSeed) continue;
+                    var cls = (int)typeof(GalaxyView).GetMethod("ClassFromSeed", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, new object[] { seed })!;
+                    var size = (int)typeof(GalaxyView).GetMethod("SunSizeFromSeed", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, new object[] { seed })!;
+                    return (world, seed, cls, size);
+                }
+            }
+            throw new Exception("No visible galaxy star for interaction validation.");
+        }
+        void Assert(bool condition, string message)
+        {
+            if (!condition) throw new Exception("Galaxy: " + message);
+        }
+        bool SameManifest(List<string> first, List<string> second) => first.Count == second.Count && first.TrueForAll(second.Contains);
+
+        try
+        {
+            SetKeys();
+            Frame(NoMouse, NoMouse);
+            var initialCamera = Camera();
+            var initialManifest = GalaxyManifest(view);
+            var baseline = new List<string>(File.ReadAllLines(Path.Combine(repo, "tools", "galaxy-world-baseline.txt")));
+            Assert(TileCount() == 9, "initial 3 × 3 exploration was changed.");
+            Assert(SameManifest(initialManifest, baseline), "initial positions, seeds or stellar classes differ from the pre-refactor universe.");
+            var debugField = typeof(GalaxyView).GetField("_showDebug", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            Assert(!(bool)debugField.GetValue(view)!, "debug overlay is visible by default.");
+            var unselectedSun = state.SunKey;
+            Click(Bounds("OpenBounds").Center);
+            Click(Bounds("FocusBounds").Center);
+            Assert(state.CurrentView == ViewMode.Galaxy && state.SunKey == unselectedSun && Camera() == initialCamera && TileCount() == 9,
+                "unselected card actions opened a system or affected the map.");
+            report.Add("PASS: nine initial sectors and all 15 system positions/seeds/classes exactly match the pre-refactor snapshot; F3 overlay hidden by default.");
+
+            var star = FirstVisibleStar();
+            var pointer = Pointer(Screen(star.World));
+            var initialSun = state.SunKey;
+            Frame(pointer, pointer);
+            Assert(state.SunKey == initialSun, "hover selected a system.");
+            Capture("galaxy-hover");
+            Click(pointer.Position);
+            var expected = new SunKey(star.Seed, star.Class, 0, star.Size, 4);
+            Assert(state.SunKey == expected, "star click changed its legacy SunKey identity.");
+            var expectedSystemSeed = unchecked((int)(long)typeof(GameScreen).GetMethod("HashSeeds", BindingFlags.Static | BindingFlags.NonPublic)!.Invoke(null, new object[] { star.Seed })!);
+            Assert(state.SystemSeed == expectedSystemSeed, "selection changed the system seed derivation.");
+            Assert(state.CurrentView == ViewMode.Galaxy, "single selection unexpectedly opened a system.");
+            Assert(TileCount() == 9, "star selection generated sectors.");
+            Capture("galaxy-selected");
+            var selectedWorld = star.World;
+            report.Add("PASS: hover is passive; clicking a star selects its unchanged seed, class and size without navigating or expanding the world.");
+
+            // Place a real star beneath each noninteractive panel to catch click-through.
+            var obscuredStar = FirstVisibleStar(state.SunKey.Seed);
+            foreach (var point in new[] { new Point(410, 27), new Point(490, 80), new Point(45, 330), new Point(446, 180), new Point(4, 180) })
+            {
+                SetCamera(Camera() + obscuredStar.World - World(point));
+                Frame(NoMouse, NoMouse);
+                var sun = state.SunKey;
+                var camera = Camera();
+                var zoom = Zoom();
+                var count = TileCount();
+                Click(point);
+                Assert(state.SunKey == sun && Camera() == camera && TileCount() == count, "a header, card, footer or border click reached the map.");
+                Frame(Pointer(point, wheel: 120), Pointer(point));
+                Assert(Camera() == camera && Zoom() == zoom, "scrolling outside the map changed the camera or zoom.");
+            }
+            SetCamera(initialCamera);
+            Frame(NoMouse, NoMouse);
+            report.Add("PASS: header, information card, footer and frame borders block map clicks and wheel input even with a star underneath.");
+
+            // Every supported key is exercised separately; no OS keyboard injection.
+            foreach (var test in new[] { (Keys.Left, new Vector2(-1, 0)), (Keys.A, new Vector2(-1, 0)), (Keys.Q, new Vector2(-1, 0)),
+                (Keys.Right, new Vector2(1, 0)), (Keys.D, new Vector2(1, 0)), (Keys.Up, new Vector2(0, -1)),
+                (Keys.W, new Vector2(0, -1)), (Keys.Z, new Vector2(0, -1)), (Keys.Down, new Vector2(0, 1)), (Keys.S, new Vector2(0, 1)) })
+            {
+                var before = Camera();
+                SetKeys(test.Item1);
+                Frame(NoMouse, NoMouse, .1);
+                SetKeys();
+                Frame(NoMouse, NoMouse);
+                var movement = Camera() - before;
+                Assert(Vector2.Dot(movement, test.Item2) > 0 && Math.Abs(Vector2.Dot(movement, new Vector2(-test.Item2.Y, test.Item2.X))) < .01f,
+                    "camera key failed: " + test.Item1);
+            }
+            SetKeys(Keys.Home);
+            Frame(NoMouse, NoMouse);
+            SetKeys();
+            Frame(NoMouse, NoMouse);
+            Assert(Vector2.Distance(Camera(), initialCamera) < .1f, "Home did not return to the initial map origin.");
+            Capture("galaxy-recentered");
+            report.Add("PASS: arrows, WASD and ZQSD pan in the expected directions; Home restores the origin.");
+
+            SetCamera(initialCamera + new Vector2(30, -20));
+            Frame(NoMouse, NoMouse);
+            Click(Bounds("FocusBounds").Center);
+            Assert(Vector2.Distance(Camera(), selectedWorld) < 1, "Center on star button did not focus the selected system.");
+            SetCamera(initialCamera + new Vector2(-30, 20));
+            SetKeys(Keys.Space);
+            Frame(NoMouse, NoMouse);
+            SetKeys();
+            Frame(NoMouse, NoMouse);
+            Assert(Vector2.Distance(Camera(), selectedWorld) < 1, "Space did not focus the selected system.");
+            Click(Bounds("HomeBounds").Center);
+
+            var anchor = new Point(map.Left + map.Width * 2 / 3, map.Top + map.Height / 3);
+            var wheel = 0;
+            for (var direction = -1; direction <= 1; direction += 2)
+            {
+                for (var i = 0; i < 4; i++)
+                {
+                    var before = World(anchor);
+                    var oldWheel = wheel;
+                    wheel += direction * 120;
+                    Frame(Pointer(anchor, wheel: wheel), Pointer(anchor, wheel: oldWheel));
+                    Assert(Vector2.Distance(before, World(anchor)) <= 1.01f / Zoom(), "wheel zoom lost the world position under the pointer.");
+                    Assert(Zoom() >= 1 && Zoom() <= 4, "zoom escaped its bounds.");
+                }
+                Capture(direction < 0 ? "galaxy-zoom-wide" : "galaxy-zoom-close");
+                Assert(Zoom() == (direction < 0 ? 1 : 4), "wheel failed to reach a zoom limit.");
+            }
+            Click(Bounds("ZoomOutBounds").Center);
+            Assert(Zoom() == 3, "minus button did not reduce zoom.");
+            Click(Bounds("ZoomInBounds").Center);
+            Assert(Zoom() == 4, "plus button did not increase zoom.");
+            Click(Bounds("HomeBounds").Center);
+            Assert(Vector2.Distance(Camera(), initialCamera) < .1f, "Origin button did not recenter.");
+            report.Add("PASS: all zoom levels clamp to 1–4, mouse-wheel zoom preserves its pointer anchor, and +/-/Origin buttons work.");
+
+            // Press over a star, cross the drag threshold, then release over empty map.
+            star = FirstVisibleStar(state.SunKey.Seed);
+            var dragStart = Screen(star.World);
+            var dragEnd = new Point(Math.Clamp(dragStart.X + 38, map.Left + 5, map.Right - 5), dragStart.Y + 20);
+            var beforeDrag = Camera();
+            var beforeDragSun = state.SunKey;
+            var beforeDragCount = TileCount();
+            var down = Pointer(dragStart, true);
+            var move = Pointer(dragEnd, true);
+            Frame(down, Pointer(dragStart));
+            Frame(move, down);
+            Frame(Pointer(dragEnd), move);
+            Assert(Vector2.Distance(Camera(), beforeDrag) > 1, "left drag did not move the map.");
+            Assert(state.SunKey == beforeDragSun && TileCount() == beforeDragCount, "dragging selected a star or generated sectors.");
+            Capture("galaxy-drag-pan");
+            foreach (var middle in new[] { false, true })
+            {
+                var start = map.Center;
+                var end = new Point(start.X - 24, start.Y + 15);
+                MouseState DragPointer(Point p) => new(p.X, p.Y, 0, ButtonState.Released,
+                    middle ? ButtonState.Pressed : ButtonState.Released,
+                    middle ? ButtonState.Released : ButtonState.Pressed, ButtonState.Released, ButtonState.Released);
+                var before = Camera();
+                Frame(DragPointer(start), Pointer(start));
+                Frame(DragPointer(end), DragPointer(start));
+                Frame(Pointer(end), DragPointer(end));
+                Assert(Vector2.Distance(Camera(), before) > 1 && state.SunKey == beforeDragSun && TileCount() == beforeDragCount,
+                    "right/middle drag failed or caused a click action.");
+            }
+
+            // Explore the adjacent eastern sector, but reject an isolated remote sector.
+            SetCamera(new Vector2(80, 16));
+            Frame(NoMouse, NoMouse);
+            var nearPoint = Screen(new Vector2(80, 16));
+            Click(nearPoint);
+            Assert(TileCount() > beforeDragCount, "clicking an adjacent sector did not reveal its neighborhood.");
+            Assert(initialManifest.TrueForAll(GalaxyManifest(view).Contains), "exploration regenerated an existing star.");
+            var expanded = TileCount();
+            Capture("galaxy-explored");
+            SetCamera(new Vector2(32 * 40 + 16, 32 * 40 + 16));
+            Frame(NoMouse, NoMouse);
+            Click(map.Center);
+            Assert(TileCount() == expanded, "an isolated sector far outside the frontier was generated.");
+            report.Add("PASS: dragging pans without selection or generation; adjacent exploration adds sectors while preserving known systems; remote expansion is rejected.");
+
+            SetCamera(initialCamera);
+            Frame(NoMouse, NoMouse);
+            // The actual game letterboxes and scales the same logical canvas.
+            context.SetDisplayTransform(2, new Rectangle(20, 20, Width * 2, Height * 2));
+            var outsideSun = state.SunKey;
+            var outsideTiles = TileCount();
+            Click(new Point(3, 3));
+            Assert(state.SunKey == outsideSun && TileCount() == outsideTiles, "letterbox border reached the map.");
+            context.SetDisplayTransform(1, new Rectangle(0, 0, Width, Height));
+            Frame(NoMouse, NoMouse);
+            SetKeys(Keys.F3);
+            Frame(NoMouse, NoMouse);
+            Assert((bool)debugField.GetValue(view)!, "F3 did not show the optional debug overlay.");
+            Capture("galaxy-debug");
+            SetKeys();
+            Frame(NoMouse, NoMouse);
+            SetKeys(Keys.F3);
+            Frame(NoMouse, NoMouse);
+            SetKeys();
+            Frame(NoMouse, NoMouse);
+            Assert(!(bool)debugField.GetValue(view)!, "F3 did not hide the debug overlay.");
+
+            GC.Collect();
+            var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+            var timer = Stopwatch.StartNew();
+            for (var i = 0; i < 120; i++) Frame(NoMouse, NoMouse);
+            timer.Stop();
+            var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+            report.Add($"Galaxy after exploration: CPU update+draw submission {timer.Elapsed.TotalMilliseconds / 120:0.00} ms/frame; {allocated / 120} managed bytes/frame, including GameTime (120 frames, excludes GPU synchronization/presentation).");
+
+            // Click the galaxy tab with an actual other star beneath it: the state
+            // must stay selected and no map action may leak through the top bar.
+            var galaxyTab = new Point(60, 22);
+            SetCamera(Camera() + obscuredStar.World - World(galaxyTab));
+            Frame(NoMouse, NoMouse);
+            var tabSun = state.SunKey;
+            var tabCount = TileCount();
+            Click(galaxyTab);
+            Assert(state.CurrentView == ViewMode.Galaxy && state.SunKey == tabSun && TileCount() == tabCount, "tab click propagated to the galaxy beneath it.");
+            SetCamera(initialCamera);
+            Frame(NoMouse, NoMouse);
+            var selectedKey = state.SunKey;
+            var previousPlanet = state.PlanetKey;
+            Click(Bounds("OpenBounds").Center);
+            Assert(state.CurrentView == ViewMode.System && state.SunKey == selectedKey, "See system button opened the wrong system.");
+            Assert(state.PlanetKey == previousPlanet, "opening a system reused the HUD click to select an unrelated planet.");
+            Capture("galaxy-open-system");
+            Click(galaxyTab);
+            Assert(state.CurrentView == ViewMode.Galaxy && state.SunKey == selectedKey, "returning to the map lost its selected system.");
+            SetKeys(Keys.Enter);
+            Frame(NoMouse, NoMouse);
+            SetKeys();
+            Assert(state.CurrentView == ViewMode.System && state.SunKey == selectedKey, "Enter did not open the selected system.");
+            Click(galaxyTab);
+            var doubleStar = FirstVisibleStar();
+            var doublePoint = Screen(doubleStar.World);
+            Click(doublePoint);
+            var doubleKey = state.SunKey;
+            Click(doublePoint);
+            Assert(state.CurrentView == ViewMode.System && state.SunKey == doubleKey, "double-click did not open the same selected system.");
+            report.Add("PASS: F3 toggles, tab/letterbox hitboxes are isolated, See system/Enter/double-click open the selected system, and returning keeps the selection.");
+
+            ValidateGalaxyBackdrop(device, target, context, output, report);
+        }
+        finally
+        {
+            keys.Invoke(null, new object[] { emptyKeys });
+            context.SetDisplayTransform(1, new Rectangle(0, 0, Width, Height));
+        }
+    }
+
+    private static void ValidateGalaxySolar(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string output, List<string> report)
+    {
+        ValidateTinySolarBakes(device, context, output, report);
+        using var screen = new GameScreen(context);
+        var view = (GalaxyView)Field(screen, "_currentView");
+        var type = typeof(GalaxyView);
+        var hud = Field(view, "_hud");
+        var map = (Rectangle)hud.GetType().GetProperty("MapBounds")!.GetValue(hud)!;
+        var cameraField = type.GetField("_cameraPos", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var zoomMethod = type.GetMethod("ChangeZoom", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var zoomProperty = type.GetProperty("CurrentZoom", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var origin = (Vector2)cameraField.GetValue(view)!;
+        using var isolated = new RenderTarget2D(device, 80, 80, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+        var initialManifest = GalaxyManifest(view);
+        var stars = new Dictionary<string, (Vector2 Position, int Seed)>();
+        var sizedStars = new List<(Vector2 Position, int Seed, int Size)>();
+        int StarSize(int seed) => (int)type.GetMethod("SunSizeFromSeed", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { seed })!;
+        foreach (DictionaryEntry entry in (IDictionary)Field(view, "_tiles"))
+        {
+            var tile = entry.Value!;
+            var coords = (Point)tile.GetType().GetProperty("Coords")!.GetValue(tile)!;
+            foreach (var local in (List<Vector2>)tile.GetType().GetProperty("SunsLocal")!.GetValue(tile)!)
+            {
+                var position = coords.ToVector2() * 32 + local;
+                var seed = (int)type.GetMethod("SeedFromPoint", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { position })!;
+                var cls = (int)type.GetMethod("ClassFromSeed", BindingFlags.NonPublic | BindingFlags.Static)!.Invoke(null, new object[] { seed })!;
+                var family = cls >= 5 ? "cold" : cls >= 3 ? "green" : "warm";
+                stars.TryAdd(family, (position, seed));
+                sizedStars.Add((position, seed, StarSize(seed)));
+            }
+        }
+        if (stars.Count != 3) throw new Exception("Galaxy solar: initial map does not contain three stellar colour families.");
+
+        void Zoom(int level)
+        {
+            while ((float)zoomProperty.GetValue(view)! != level)
+                zoomMethod.Invoke(view, new object[] { Math.Sign(level - (float)zoomProperty.GetValue(view)!), map.Center });
+        }
+        void Frame(double seconds, MouseState? mouse = null, MouseState? previousMouse = null)
+        {
+            var time = new GameTime(TimeSpan.FromSeconds(seconds), TimeSpan.FromSeconds(1d / 60));
+            screen.Update(time, mouse ?? NoMouse, previousMouse ?? NoMouse);
+            device.SetRenderTarget(target);
+            device.Clear(Color.Black);
+            screen.Draw(time);
+            device.SetRenderTarget(null);
+        }
+        void CaptureMap(string file)
+        {
+            using var stream = File.Create(Path.Combine(output, file));
+            target.SaveAsPng(stream, Width, Height);
+        }
+        object VisibleSunFor(int seed)
+        {
+            foreach (var entry in (IEnumerable)Field(view, "_visibleSuns"))
+            {
+                var itemType = entry.GetType();
+                if ((int)itemType.GetProperty("Seed")!.GetValue(entry)! == seed)
+                    return entry;
+            }
+            throw new Exception("Galaxy solar: centred star missing from the visible map.");
+        }
+        object SunFor(int seed)
+        {
+            var entry = VisibleSunFor(seed);
+            return entry.GetType().GetProperty("AnimatedRenderer")!.GetValue(entry)
+                ?? throw new Exception("Galaxy solar: close zoom still uses a static solar bake.");
+        }
+        int Diameter(object entry) => (int)entry.GetType().GetProperty("Diameter")!.GetValue(entry)!;
+        Color[] CaptureSun(object sun, string? file = null)
+        {
+            device.SetRenderTarget(isolated);
+            device.Clear(Color.Transparent);
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            sun.GetType().GetMethod("Draw")!.Invoke(sun, new object[] { context.SpriteBatch, context.Pixel, new Vector2(40), 1f });
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            var pixels = ReadTexture(isolated);
+            var gridOffset = ((int)Field(sun, "_diameter") / 2) % 2;
+            AssertTwoPixelBlocks(pixels, 80, 80, gridOffset, gridOffset);
+            if (file != null)
+            {
+                using var stream = File.Create(Path.Combine(output, file));
+                isolated.SaveAsPng(stream, 80, 80);
+            }
+            return pixels;
+        }
+        static double Delta(Color[] a, Color[] b)
+        {
+            var sum = 0d;
+            for (var i = 0; i < a.Length; i++)
+                sum += Math.Abs(a[i].R - b[i].R) + Math.Abs(a[i].G - b[i].G) + Math.Abs(a[i].B - b[i].B);
+            return sum / (a.Length * 3d);
+        }
+        static Color[] ReadTexture(Texture2D texture)
+        {
+            var pixels = new Color[texture.Width * texture.Height];
+            texture.GetData(pixels);
+            return pixels;
+        }
+        static int Differences(Color[] first, Color[] second)
+        {
+            var count = 0;
+            for (var i = 0; i < first.Length; i++) if (first[i] != second[i]) count++;
+            return count;
+        }
+
+        foreach (var zoom in new[] { 1, 2, 3, 4 })
+        {
+            Zoom(zoom);
+            cameraField.SetValue(view, origin);
+            foreach (var seconds in new[] { 0d, 1d, 60d, 240d })
+            {
+                Frame(seconds);
+                CaptureMap($"galaxy-solar-zoom{zoom}-t{seconds:000}.png");
+                foreach (var entry in (IEnumerable)Field(view, "_visibleSuns"))
+                {
+                    var renderer = entry.GetType().GetProperty("AnimatedRenderer")!.GetValue(entry);
+                    if (zoom < 3 ? renderer != null : renderer == null)
+                        throw new Exception("Galaxy solar: animated effects are not limited to close zooms 3 and 4.");
+                    var diameter = Diameter(entry);
+                    var seed = (int)entry.GetType().GetProperty("Seed")!.GetValue(entry)!;
+                    if (diameter != zoom * 8)
+                        throw new Exception("Galaxy solar: star size differs from the restored uniform diameter at this zoom.");
+                    if (renderer != null && ((int)Field(renderer, "_diameter") != diameter || (int)Field(renderer, "_cellSize") != 2))
+                        throw new Exception("Galaxy solar: close zoom changed its expected stellar diameter or grid size.");
+                    if (renderer == null)
+                    {
+                        var textures = entry.GetType().GetProperty("Texture")!.GetValue(entry)!;
+                        var albedo = (Texture2D)textures.GetType().GetProperty("Albedo")!.GetValue(textures)!;
+                        if (albedo.Width != diameter || albedo.Height != diameter)
+                            throw new Exception("Galaxy solar: distant baked texture has the wrong stellar diameter.");
+                        ValidateRoundedSolarMask(albedo, $"zoom {zoom}, star {seed}, diameter {diameter}");
+                        if (seconds == 0)
+                        {
+                            var cls = (int)entry.GetType().GetProperty("ClassId")!.GetValue(entry)!;
+                            ValidateSolarSampling(albedo, device, seed, cls, 2);
+                        }
+                    }
+                }
+            }
+            report.Add($"PASS: zoom {zoom} restores the same {zoom * 8}-pixel diameter for every visible star with 2-pixel sampling." +
+                (zoom < 3 ? " All baked silhouettes remain rounded and symmetric." : ""));
+        }
+        report.Add("Captured galaxy solar map at every zoom (1/2/3/4) and absolute time 0/1/60/240 seconds.");
+
+        foreach (var family in new[] { "warm", "green", "cold" })
+        {
+            var star = stars[family];
+            cameraField.SetValue(view, star.Position);
+            var frames = new Dictionary<double, Color[]>();
+            var outerPixels = 0;
+            foreach (var seconds in new[] { 0d, 1d, 60d, 240d })
+            {
+                Frame(seconds);
+                var sun = SunFor(star.Seed);
+                var diameter = (int)Field(sun, "_diameter");
+                if (diameter != Diameter(VisibleSunFor(star.Seed)) || diameter != 32 || (int)Field(sun, "_cellSize") != 2)
+                    throw new Exception("Galaxy solar: zoom 4 lost its original 32-pixel diameter or 2-pixel cell grid.");
+                var surface = (Texture2D)Field(sun, "_surface");
+                var surfacePixels = ReadTexture(surface);
+                for (var y = 0; y < surface.Height; y++)
+                for (var x = 0; x < surface.Width; x++)
+                {
+                    var normal = new Vector2((x + .5f) * 2 / surface.Width - 1, (y + .5f) * 2 / surface.Height - 1);
+                    if (surfacePixels[y * surface.Width + x].A != (normal.LengthSquared() <= 1 ? 255 : 0))
+                        throw new Exception("Galaxy solar: the stellar surface is no longer a fully opaque pixel circle.");
+                }
+                frames[seconds] = CaptureSun(sun, $"galaxy-solar-{family}-t{seconds:000}.png");
+                // The two static corona contours extend at most four pixels.
+                // Anything farther than this is a real arch or drifting ember.
+                for (var y = 0; y < 80; y++)
+                for (var x = 0; x < 80; x++)
+                    if (Vector2.Distance(new Vector2(x + .5f, y + .5f), new Vector2(40)) > diameter * .5f + 5f
+                        && frames[seconds][y * 80 + x].A >= 25) outerPixels++;
+            }
+            var shortDelta = Delta(frames[0], frames[1]);
+            var longDelta = Math.Max(Delta(frames[0], frames[60]), Delta(frames[0], frames[240]));
+            if (longDelta < .25 || Differences(frames[0], frames[240]) < 40)
+                throw new Exception("Galaxy solar: the close star does not evolve over several minutes.");
+            if (shortDelta > longDelta * .12 + .015)
+                throw new Exception("Galaxy solar: one-second movement is too large for a nearly static animated chart.");
+            if (outerPixels == 0) throw new Exception("Galaxy solar: no prominence or ember visible beyond the corona for " + family);
+            Frame(0);
+            if (Differences(frames[0], CaptureSun(SunFor(star.Seed))) != 0)
+                throw new Exception("Galaxy solar: absolute time is not deterministic.");
+            Frame(240);
+            var before = CaptureSun(SunFor(star.Seed));
+            Zoom(1);
+            Frame(240);
+            Zoom(4);
+            Frame(240);
+            if (Differences(before, CaptureSun(SunFor(star.Seed))) != 0)
+                throw new Exception("Galaxy solar: zooming out and back restarted the star animation.");
+            cameraField.SetValue(view, star.Position + new Vector2(10000));
+            Frame(240);
+            cameraField.SetValue(view, star.Position);
+            Frame(240);
+            if (Differences(before, CaptureSun(SunFor(star.Seed))) != 0)
+                throw new Exception("Galaxy solar: leaving and returning with the camera restarted the star animation.");
+            report.Add($"PASS: {family} close sun has opaque plasma, exact 2x2 GPU cells and {outerPixels} prominence/ember pixels beyond the corona; mean RGB delta 1s={shortDelta:0.000}, long={longDelta:0.000}; same absolute time, rezoom and camera return reproduce the same star.");
+        }
+
+        sizedStars.Sort((a, b) => a.Size.CompareTo(b.Size));
+        foreach (var (label, star, time) in new[] { ("small", sizedStars[0], 400d), ("large", sizedStars[^1], 410d) })
+        {
+            cameraField.SetValue(view, star.Position);
+            Frame(time);
+            var visible = VisibleSunFor(star.Seed);
+            var diameter = Diameter(visible);
+            var entries = (IList)Field(view, "_visibleSuns");
+            var expectedIndex = entries.IndexOf(visible);
+            var findSun = type.GetMethod("FindSun", BindingFlags.Instance | BindingFlags.NonPublic)!;
+            var inside = new Point(map.Center.X + diameter / 2 - 1, map.Center.Y);
+            var outside = new Point(map.Center.X + diameter / 2 + 3, map.Center.Y);
+            if ((int)findSun.Invoke(view, new object[] { inside })! != expectedIndex
+                || (int)findSun.Invoke(view, new object[] { outside })! == expectedIndex)
+                throw new Exception("Galaxy solar: the " + label + " star's hitbox does not follow its own visible diameter.");
+            MouseState Pointer(Point point, bool pressed) => new(point.X, point.Y, 0,
+                pressed ? ButtonState.Pressed : ButtonState.Released, ButtonState.Released,
+                ButtonState.Released, ButtonState.Released, ButtonState.Released);
+            Frame(time + 1, Pointer(inside, true), Pointer(inside, false));
+            Frame(time + 2, Pointer(inside, false), Pointer(inside, true));
+            var state = (GameState)Field(screen, "_state");
+            if (state.CurrentView != ViewMode.Galaxy || state.SunKey.Seed != star.Seed || state.SunKey.Size != star.Size)
+                throw new Exception("Galaxy solar: clicking the " + label + " star's visible limb selected the wrong system identity.");
+            var previewDiameter = (int)Field(Field(view, "_preview"), "_diameter");
+            if (previewDiameter != 40 || diameter != 32)
+                throw new Exception("Galaxy solar: selection does not retain the original uniform map and preview dimensions.");
+            Frame(time + 3);
+            CaptureMap($"galaxy-size-{label}-selected.png");
+            report.Add($"PASS: {label} star keeps system Size={star.Size}, map diameter={diameter}, preview diameter={previewDiameter}; its own limb selects it and the area beyond its hitbox does not.");
+        }
+
+        if (!initialManifest.TrueForAll(GalaxyManifest(view).Contains))
+            throw new Exception("Galaxy solar: zooming changed existing star identities.");
+        ValidateGalaxySolarCache(device, report);
+        File.WriteAllText(Path.Combine(output, "galaxy-solar-review.html"),
+            "<!doctype html><meta charset='utf-8'><title>Galaxie · projections solaires</title>" +
+            "<style>body{background:#0b1020;color:#e7eaf4;font:16px system-ui;margin:24px}h1,h2{font-weight:500}section{display:flex;gap:14px;flex-wrap:wrap;margin-bottom:28px}figure{margin:0}img{image-rendering:pixelated}figcaption{margin:6px 0;color:#aab8d0}.sun{width:240px;height:240px}.map{width:640px;height:360px}</style>" +
+            "<h1>Projections solaires · galaxie</h1><p>Couronnes et petites émanations en pixels. Chaque cycle se développe sur plusieurs minutes.</p>" +
+            "<h2>Dimensions d'origine</h2><figure><img src='galaxy-tiny-suns.png' width='320' height='480'><figcaption>Zoom ×1 : 8 pixels. Zoom ×2 : 16 pixels. Cellules de 2 pixels dans les deux cas. Même graine dans chaque ligne : corail, menthe, azur.</figcaption></figure>" +
+            string.Join("", Array.ConvertAll(new[] { "warm", "green", "cold" }, family => "<h2>" +
+                (family == "warm" ? "Soleil abricot" : family == "green" ? "Soleil menthe" : "Soleil glacé") + "</h2><section>" +
+                string.Join("", Array.ConvertAll(new[] { 0, 1, 60, 240 }, seconds => $"<figure><img class='sun' src='galaxy-solar-{family}-t{seconds:000}.png'><figcaption>{seconds} s · détail agrandi ×3</figcaption></figure>")) + "</section>")) +
+            "<h2>Échelle de la carte</h2><section>" +
+            string.Join("", Array.ConvertAll(new[] { 1, 2, 3, 4 }, zoom => $"<figure><img class='map' src='galaxy-solar-zoom{zoom}-t060.png'><figcaption>Zoom ×{zoom}</figcaption></figure>")) + "</section>" +
+            "<h2>Dimensions identiques dans la carte et la fiche</h2><section>" +
+            string.Join("", Array.ConvertAll(new[] { "small", "large" }, size => $"<figure><img class='map' src='galaxy-size-{size}-selected.png'><figcaption>{(size == "small" ? "Premier système" : "Second système")} · 32 pixels dans la carte, 40 dans la fiche</figcaption></figure>")) + "</section>");
+    }
+
+    private static void ValidateRoundedSolarMask(Texture2D texture, string label)
+    {
+        var width = texture.Width;
+        var height = texture.Height;
+        var pixels = new Color[width * height];
+        texture.GetData(pixels);
+        if (width != height) throw new Exception("Solar silhouette is not square-bounded: " + label);
+        if (pixels[0].A != 0 || pixels[width - 1].A != 0
+            || pixels[(height - 1) * width].A != 0 || pixels[^1].A != 0)
+            throw new Exception("Solar silhouette has opaque corners and looks square: " + label);
+        if (pixels[(height / 2) * width + width / 2].A != 255
+            || pixels[width / 2].A != 255 || pixels[(height - 1) * width + width / 2].A != 255
+            || pixels[(height / 2) * width].A != 255 || pixels[(height / 2) * width + width - 1].A != 255)
+            throw new Exception("Solar silhouette lost its opaque centre or circular axis endpoints: " + label);
+        for (var y = 0; y < height; y++)
+        for (var x = 0; x < width; x++)
+        {
+            var alpha = pixels[y * width + x].A;
+            if (alpha is not (0 or 255) || alpha != pixels[y * width + width - 1 - x].A
+                || alpha != pixels[(height - 1 - y) * width + x].A || alpha != pixels[x * width + y].A)
+                throw new Exception("Solar silhouette lost its crisp symmetric pixel mask: " + label);
+        }
+    }
+
+    private static void ValidateSolarSampling(Texture2D actual, GraphicsDevice device, int seed, int cls, int cell)
+    {
+        var type = typeof(GalaxyView).Assembly.GetType("MonogameAS.Galaxy.SunGenerator")!;
+        var result = type.GetMethod("Bake")!.Invoke(null, new object[] { device, seed, cls, actual.Width, 3, cell })!;
+        var expected = (Texture2D)result.GetType().GetProperty("Albedo")!.GetValue(result)!;
+        var halo = (Texture2D)result.GetType().GetProperty("Halo")!.GetValue(result)!;
+        try
+        {
+            var expectedPixels = new Color[expected.Width * expected.Height];
+            var actualPixels = new Color[actual.Width * actual.Height];
+            expected.GetData(expectedPixels);
+            actual.GetData(actualPixels);
+            for (var i = 0; i < actualPixels.Length; i++)
+                if (actualPixels[i] != expectedPixels[i])
+                    throw new Exception($"Galaxy sampling differs by star size: diameter {actual.Width}, seed {seed}, expected uniform {cell}-pixel cells.");
+            if (cell == 2) AssertTwoPixelBlocks(actualPixels, actual.Width, actual.Height);
+        }
+        finally { expected.Dispose(); halo.Dispose(); }
+    }
+
+    private static void ValidateTinySolarBakes(GraphicsDevice device, RenderContext context, string output, List<string> report)
+    {
+        var type = typeof(GalaxyView).Assembly.GetType("MonogameAS.Galaxy.SunGenerator")!;
+        var bake = type.GetMethod("Bake")!;
+        var textures = new List<(Texture2D Albedo, Texture2D Halo, int Column, int Row)>();
+        using var contact = new RenderTarget2D(device, 160, 240, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+        try
+        {
+            var classes = new[] { 0, 3, 5 };
+            var diameters = new[] { 8, 16 };
+            for (var row = 0; row < classes.Length; row++)
+            for (var column = 0; column < diameters.Length; column++)
+            {
+                var diameter = diameters[column];
+                var result = bake.Invoke(null, new object[] { device, 123456789, classes[row], diameter, 3, 2 })!;
+                var albedo = (Texture2D)result.GetType().GetProperty("Albedo")!.GetValue(result)!;
+                var halo = (Texture2D)result.GetType().GetProperty("Halo")!.GetValue(result)!;
+                textures.Add((albedo, halo, column, row));
+                if (albedo.Width != diameter || albedo.Height != diameter)
+                    throw new Exception("Tiny sun rounding changed its physical display size.");
+                ValidateRoundedSolarMask(albedo, $"direct bake, class {classes[row]}, diameter {diameter}");
+                var pixels = new Color[albedo.Width * albedo.Height];
+                albedo.GetData(pixels);
+                AssertTwoPixelBlocks(pixels, albedo.Width, albedo.Height);
+            }
+            device.SetRenderTarget(contact);
+            device.Clear(new Color(8, 13, 24));
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+            foreach (var (albedo, _, column, row) in textures)
+            {
+                var diameter = albedo.Width * 4;
+                context.SpriteBatch.Draw(albedo, new Rectangle(column * 80 + 40 - diameter / 2,
+                    row * 80 + 40 - diameter / 2, diameter, diameter), Color.White);
+            }
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            using var stream = File.Create(Path.Combine(output, "galaxy-tiny-suns.png"));
+            contact.SaveAsPng(stream, 160, 240);
+            report.Add("PASS: original 8/16-pixel baked suns retain rounded masks and 2-pixel cells in three palettes; enlarged contact sheet captured.");
+        }
+        finally
+        {
+            foreach (var (albedo, halo, _, _) in textures) { albedo.Dispose(); halo.Dispose(); }
+        }
+    }
+
+    private static void ValidateGalaxySolarCache(GraphicsDevice device, List<string> report)
+    {
+        var type = typeof(GalaxyView).Assembly.GetType("MonogameAS.Galaxy.GalaxySunCache")!;
+        var cache = Activator.CreateInstance(type, device, 2)!;
+        var method = type.GetMethod("GetOrCreate")!;
+        var retained = new List<object>();
+        object Get(int seed, int diameter = 32)
+        {
+            var renderer = method.Invoke(cache, new object[] { new SunKey(seed, 0, 3200, 12, 4), diameter })!;
+            if (!retained.Contains(renderer)) retained.Add(renderer);
+            return renderer;
+        }
+        bool Disposed(object renderer) => ((Texture2D)Field(renderer, "_surface")).IsDisposed
+            && ((Texture2D)Field(renderer, "_corona")).IsDisposed;
+        try
+        {
+            var first = Get(1);
+            var second = Get(2);
+            if (!ReferenceEquals(first, Get(1))) throw new Exception("Galaxy solar cache: existing stars are recreated.");
+            var third = Get(3);
+            if ((int)type.GetProperty("Count")!.GetValue(cache)! != 2 || !Disposed(second) || Disposed(first) || Disposed(third))
+                throw new Exception("Galaxy solar cache: LRU capacity or GPU resource eviction failed.");
+            var resized = Get(1, 24);
+            if (ReferenceEquals(first, resized) || (int)Field(resized, "_diameter") != 24)
+                throw new Exception("Galaxy solar cache: zoom-specific geometry is not retained independently.");
+            report.Add("PASS: animated galaxy cache reuses existing stars, respects its capacity, evicts least-recently-used entries and disposes both GPU textures; zoom diameters are separate.");
+        }
+        finally
+        {
+            ((IDisposable)cache).Dispose();
+        }
+        if (retained.Exists(renderer => !Disposed(renderer)))
+            throw new Exception("Galaxy solar cache: closing the view retains undisposed GPU resources.");
+        report.Add("PASS: disposing the animated galaxy cache releases all retained surface and corona textures.");
+    }
+
+    private static void ValidateGalaxyBackdrop(GraphicsDevice device, RenderTarget2D target, RenderContext context,
+        string output, List<string> report)
+    {
+        var type = typeof(GalaxyView).Assembly.GetType("MonogameAS.Rendering.PixelGalaxyBackdrop")!;
+        object Make(int seed) => Activator.CreateInstance(type, device, new Point(Width, Height), seed)!;
+        var update = type.GetMethod("Update")!;
+        var draw = type.GetMethod("Draw")!;
+        var tint = new Color(158, 172, 218);
+        var first = Make(123456789);
+        var repeat = Make(123456789);
+        try
+        {
+            Color[] Pixels(object instance, double time, Vector2 camera)
+            {
+                update.Invoke(instance, new object[] { time, camera, 2f, tint });
+                var texture = (Texture2D)Field(instance, "_texture");
+                if (texture.Width != 160 || texture.Height != 90) throw new Exception("Galaxy backdrop lost its coarse pixel-art grid.");
+                var pixels = new Color[texture.Width * texture.Height];
+                texture.GetData(pixels);
+                foreach (var color in pixels)
+                    if (color.A != 255) throw new Exception("Galaxy backdrop contains unexpected transparency.");
+                return pixels;
+            }
+            void Capture(object instance, string name)
+            {
+                device.SetRenderTarget(target);
+                device.Clear(Color.Black);
+                context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp);
+                draw.Invoke(instance, new object[] { context.SpriteBatch, context.Pixel });
+                context.SpriteBatch.End();
+                device.SetRenderTarget(null);
+                using var stream = File.Create(Path.Combine(output, name + ".png"));
+                target.SaveAsPng(stream, Width, Height);
+            }
+            var start = Pixels(first, 0, Vector2.Zero);
+            Capture(first, "galaxy-background-t000");
+            var same = Pixels(repeat, 0, Vector2.Zero);
+            var late = Pixels(first, 90, Vector2.Zero);
+            Capture(first, "galaxy-background-t090");
+            var panned = Pixels(first, 91, new Vector2(250, -125));
+            var animationChanges = 0;
+            var panChanges = 0;
+            for (var i = 0; i < start.Length; i++)
+            {
+                if (start[i] != same[i]) throw new Exception("Galaxy backdrop is not deterministic.");
+                if (start[i] != late[i]) animationChanges++;
+                if (late[i] != panned[i]) panChanges++;
+            }
+            if (animationChanges < 20 || panChanges < 20) throw new Exception("Galaxy nebula animation/parallax did not change its field.");
+            report.Add($"PASS: seeded opaque 160 × 90 backdrop is deterministic; slow animation changed {animationChanges} texels, pan/time changed {panChanges} texels.");
+        }
+        finally { ((IDisposable)first).Dispose(); ((IDisposable)repeat).Dispose(); }
+    }
+
+    private static void WriteGalaxyGallery(string repo, string output)
+    {
+        var html = new System.Text.StringBuilder("""
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Carte stellaire — Refonte pixel art</title><style>
+body{margin:0;background:#0d1220;color:#e2eaf5;font:16px system-ui,sans-serif;padding:32px}main{max-width:1320px;margin:auto}
+h1{font-size:26px;font-weight:600;margin:0 0 8px}p{color:#9eafc9;line-height:1.6}a{color:#a3ddca}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,560px),1fr));gap:24px;margin-top:28px}
+figure{margin:0;background:#171e31;border:1px solid #35415e;padding:10px}img{display:block;width:100%;height:auto;image-rendering:pixelated}
+figcaption{padding:12px 3px 5px;font-size:15px;color:#c1cee3}code{color:#b8afe7}</style><main>
+<h1>Carte stellaire</h1><p>Une carte plus lisible, des étoiles colorées et un espace à explorer. Captures GPU en 640 × 360, agrandies sans lissage.<br>
+La génération et l'identité des systèmes sont conservées. <a href="report.txt">Consulter les vérifications</a>.</p><div class="grid">
+""");
+        void Figure(string path, string caption)
+        {
+            html.Append("<figure><a href=\"").Append(path).Append("\"><img src=\"").Append(path)
+                .Append("\" alt=\"").Append(caption).Append("\"></a><figcaption>").Append(caption).Append("</figcaption></figure>");
+        }
+        var before = Path.Combine(repo, "artifacts", "visual-review", "galaxy-redesign", "before", "galaxy-overview.png");
+        if (File.Exists(before)) Figure(Path.GetRelativePath(output, before).Replace('\\', '/'), "Avant — carte et interface précédentes");
+        foreach (var (file, caption) in new[] {
+            ("galaxy-overview", "Après — vue d'ensemble"),
+            ("galaxy-hover", "Survol — repérer une étoile"),
+            ("galaxy-selected", "Sélection — aperçu et accès au système"),
+            ("galaxy-explored", "Exploration — nouveaux secteurs voisins"),
+            ("galaxy-zoom-wide", "Zoom éloigné — lire les secteurs"),
+            ("galaxy-zoom-close", "Zoom rapproché — conserver les pixels"),
+            ("galaxy-drag-pan", "Déplacement — glisser dans la carte"),
+            ("galaxy-open-system", "Navigation — retrouver le système sélectionné"),
+            ("galaxy-background-t000", "Fond procédural — instant initial"),
+            ("galaxy-background-t090", "Fond procédural — animation lente à 90 secondes") })
+            Figure(file + ".png", caption);
+        html.Append("</div></main></html>");
+        File.WriteAllText(Path.Combine(output, "comparison.html"), html.ToString());
+    }
+
+    private static void ValidateEditedWorldNavigation(RenderContext context, List<string> report)
+    {
+        using var screen = new GameScreen(context);
+        var state = (GameState)Field(screen, "_state");
+        var time = new GameTime(TimeSpan.FromSeconds(3), TimeSpan.FromSeconds(1d / 60));
+        var callback = typeof(GameScreen).GetMethod("OnSunSelected", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var sunA = new SunKey(417, 0, 5778, 12, 4);
+        var sunB = new SunKey(992, 0, 3200, 12, 4);
+        void Tab(int x)
+        {
+            var mouse = new MouseState(x, 22, 0, ButtonState.Pressed, ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+            screen.Update(time, mouse, NoMouse);
+            screen.Update(time, NoMouse, mouse);
+        }
+        callback.Invoke(screen, new object[] { sunA });
+        Tab(190);
+        var systemView = (SystemView)Field(screen, "_currentView");
+        var positions = (IEnumerable)Field(systemView, "_planetScreen");
+        PlanetKey original = default;
+        foreach (var entry in positions)
+        {
+            var position = (Vector2)Field(entry, "Item2");
+            if (position.Y < 55 || position.Y > Height - 30) continue;
+            var orbital = (PlanetOrbital)Field(entry, "Item1");
+            var mouse = new MouseState((int)position.X, (int)position.Y, 0, ButtonState.Pressed,
+                ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+            screen.Update(time, mouse, NoMouse);
+            screen.Update(time, NoMouse, mouse);
+            if (state.PlanetKey == orbital.PlanetKey) { original = state.PlanetKey; break; }
+        }
+        if (original == default) throw new Exception("Could not select a world for navigation persistence validation.");
+        Tab(320);
+        var planetView = (PlanetView)Field(screen, "_currentView");
+        var setKeys = typeof(Keyboard).GetMethod("SetKeys", BindingFlags.Static | BindingFlags.NonPublic)!;
+        setKeys.Invoke(null, new object[] { new List<Keys> { Keys.F3 } });
+        screen.Update(time, NoMouse, NoMouse);
+        setKeys.Invoke(null, new object[] { new List<Keys>() });
+        screen.Update(time, NoMouse, NoMouse);
+        var sliders = (IList)Field(planetView, "_planetSliders");
+        var index = -1;
+        for (var i = 0; i < sliders.Count; i++)
+            if ((string)sliders[i]!.GetType().GetProperty("Label")!.GetValue(sliders[i])! == "Sea") index = i;
+        if (index < 0) throw new Exception("Sea slider is missing.");
+        var height = (int)planetView.GetType().GetMethod("GetDebugPanelHeight", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(planetView, null)!;
+        var rows = (sliders.Count + 1) / 2;
+        const int columnWidth = (Width - 16 - 12 - 8) / 2;
+        var row = new Rectangle(14 + index / rows * (columnWidth + 8), Height - height + 38 + index % rows * 20, columnWidth, 20);
+        var track = (Rectangle)sliders[index]!.GetType().GetMethod("MakeTrackRect")!.Invoke(null, new object[] { row, 60, 32 })!;
+        var edit = new MouseState(track.Right - 2, track.Center.Y, 0, ButtonState.Pressed,
+            ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+        screen.Update(time, edit, NoMouse);
+        screen.Update(time, NoMouse, edit);
+        var edited = state.PlanetKey;
+        if (edited.Params.ElevSeaLevel == original.Params.ElevSeaLevel) throw new Exception("Actual Sea slider click did not edit the selected world.");
+        Tab(65);
+        callback.Invoke(screen, new object[] { sunB });
+        Tab(190);
+        var other = (SystemData)Field(Field(screen, "_currentView"), "_system");
+        foreach (var orbital in other.Planets)
+            if (orbital.PlanetKey.Params.ElevSeaLevel != PlanetParams.Default.ElevSeaLevel)
+                throw new Exception("A terrain edit leaked into another system.");
+        Tab(65);
+        callback.Invoke(screen, new object[] { sunA });
+        Tab(190);
+        var returned = (SystemData)Field(Field(screen, "_currentView"), "_system");
+        var found = false;
+        foreach (var orbital in returned.Planets)
+            if (orbital.PlanetKey.Seed == edited.Seed)
+            {
+                if (orbital.PlanetKey != edited) throw new Exception("World A lost its edited terrain after Planet A -> Galaxy -> System B -> System A.");
+                found = true;
+            }
+        if (!found) throw new Exception("Returned system no longer contains the edited world.");
+        report.Add("PASS: actual F3 Sea slider edit survives Planet A -> Galaxy -> System B -> System A, including its palette and parameters; edits do not leak into system B.");
+    }
+
+    private sealed class DeviceService(GraphicsDevice graphicsDevice) : IGraphicsDeviceService
+    {
+        public GraphicsDevice GraphicsDevice { get; } = graphicsDevice;
+        public event EventHandler<EventArgs>? DeviceCreated { add { } remove { } }
+        public event EventHandler<EventArgs>? DeviceDisposing { add { } remove { } }
+        public event EventHandler<EventArgs>? DeviceReset { add { } remove { } }
+        public event EventHandler<EventArgs>? DeviceResetting { add { } remove { } }
+    }
+
+    private static void AssertHidden(IntPtr window)
+    {
+        var flags = SDL_GetWindowFlags(window);
+        if ((flags & 0x8) == 0 || (flags & 0x4) != 0)
+            throw new Exception("The validation window must remain hidden.");
+    }
+
+    [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl)] private static extern uint SDL_GetWindowFlags(IntPtr window);
+}

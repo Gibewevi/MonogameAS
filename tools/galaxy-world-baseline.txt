@@ -1,0 +1,15 @@
+tile=-1,-1; star=0; x=-19.08163; y=-19.999561; seed=14345908; class=3
+tile=-1,0; star=0; x=-25.200418; y=14.193529; seed=1269915; class=3
+tile=-1,0; star=1; x=-10.822403; y=21.690819; seed=9143326; class=3
+tile=-1,0; star=2; x=-6.179512; y=5.822873; seed=4063728; class=4
+tile=-1,1; star=0; x=-26.27007; y=37.628895; seed=21334665; class=2
+tile=-1,1; star=1; x=-9.686403; y=54.906754; seed=27225149; class=0
+tile=0,-1; star=0; x=19.58349; y=-27.486765; seed=10429627; class=5
+tile=0,0; star=0; x=21.240807; y=4.5770907; seed=7840668; class=3
+tile=0,0; star=1; x=20.787125; y=21.589605; seed=16762781; class=0
+tile=1,-1; star=0; x=44.6802; y=-17.592672; seed=3555762; class=0
+tile=1,-1; star=1; x=53.58858; y=-4.5046425; seed=13477390; class=3
+tile=1,-1; star=2; x=59.310184; y=-19.606585; seed=7873504; class=2
+tile=1,0; star=0; x=52.35612; y=11.283344; seed=9192480; class=3
+tile=1,1; star=0; x=41.51; y=38.27678; seed=26782723; class=2
+tile=1,1; star=1; x=57.911587; y=45.422504; seed=25193669; class=4

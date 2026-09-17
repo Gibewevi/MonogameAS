@@ -31,13 +31,17 @@ public class MainMenuScreen : IScreen
     {
         RefreshLayout();
 
-        if (_newGameButton.Update(mouse, previousMouse))
+        var logicalPos = _context.ScreenToLogical(mouse.Position);
+        var left = mouse.LeftButton == ButtonState.Pressed;
+        var leftPrev = previousMouse.LeftButton == ButtonState.Pressed;
+
+        if (_newGameButton.Update(logicalPos, left, leftPrev))
         {
             Logging.Logger.Info("MainMenu: Nouvelle partie clicked");
             _startGame();
         }
 
-        if (_quitButton.Update(mouse, previousMouse))
+        if (_quitButton.Update(logicalPos, left, leftPrev))
         {
             Logging.Logger.Info("MainMenu: Quitter clicked");
             _exitGame();

@@ -1,0 +1,16 @@
+# Generated build and validation output
+bin/
+obj/
+/artifacts/
+/logs/
+/saves/
+
+# Godot caches
+.godot/
+.import/
+.export/
+
+# Local editor files
+.vs/
+*.user
+*.suo

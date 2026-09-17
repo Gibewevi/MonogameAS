@@ -20,12 +20,12 @@ public class Button
     public bool IsHover { get; private set; }
     public bool IsPressed { get; private set; }
 
-    public bool Update(MouseState currentMouse, MouseState previousMouse)
+    public bool Update(Point mousePos, bool leftPressed, bool leftPressedPrev)
     {
-        IsHover = Bounds.Contains(currentMouse.Position);
-        IsPressed = IsHover && currentMouse.LeftButton == ButtonState.Pressed;
-        var wasReleased = previousMouse.LeftButton == ButtonState.Released;
-        var nowPressed = currentMouse.LeftButton == ButtonState.Pressed;
+        IsHover = mousePos.X >= 0 && Bounds.Contains(mousePos);
+        IsPressed = IsHover && leftPressed;
+        var wasReleased = !leftPressedPrev;
+        var nowPressed = leftPressed;
         return IsHover && wasReleased && nowPressed;
     }
 

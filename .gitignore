@@ -5,6 +5,10 @@ obj/
 /logs/
 /saves/
 
+# Archived projects kept locally
+/ancien code/
+/godot code/
+
 # Godot caches
 .godot/
 .import/

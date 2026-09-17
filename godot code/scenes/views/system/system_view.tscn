@@ -1,6 +1,0 @@
-[gd_scene load_steps=2 format=3 uid="uid://b3ou1ol5kh5uf"]
-
-[ext_resource type="Script" uid="uid://brykc067o7rjo" path="res://scripts/system/controllers/SystemController.gd" id="1_7kudc"]
-
-[node name="SystemView" type="Node2D"]
-script = ExtResource("1_7kudc")

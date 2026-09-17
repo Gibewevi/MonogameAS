@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://bbdbfrjimlohv"]
+
+[ext_resource type="Script" uid="uid://c1trncokylv2d" path="res://scenes/views/planet/planet_view.gd" id="1_7gmla"]
+
+[node name="PlanetView" type="Node2D"]
+script = ExtResource("1_7gmla")

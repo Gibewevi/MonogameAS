@@ -1,0 +1,33 @@
+# Godot-specific
+.import/                    # Cache des imports, recréé automatiquement
+.export/                    # Exports générés
+export.cfg
+export_presets.cfg
+
+# Godot 4 caches
+.godot/                     # Nouveau dossier de cache Godot (scènes, thumbnails, etc.)
+*.translation               # Fichiers binaires de traduction générés
+
+# OS-specific
+.DS_Store                   # macOS
+Thumbs.db                   # Windows
+
+# Editor / IDE
+.vscode/                    # VS Code config perso
+.idea/                      # JetBrains
+*.swp                       # Vim swap
+*.tmp                       # Fichiers temporaires
+
+# Logs
+*.log
+
+# Compiled files
+*.mono                       # Assemblages Mono si tu utilises C#
+*.dll
+*.exe
+*.so
+*.dylib
+*.pdb
+
+# Other
+*.import                     # Fichiers import intermédiaires

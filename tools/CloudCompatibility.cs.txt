@@ -1,0 +1,256 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text.RegularExpressions;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using MonogameAS.Planet;
+
+// Compiled only by Test-CloudCompatibility.ps1. The baseline assembly is built
+// from git source in a temporary directory; no copied reference implementation.
+internal static class CloudCompatibility
+{
+    private static readonly BindingFlags Fields = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+    private static readonly Assembly Current = typeof(PlanetKey).Assembly;
+    private static Assembly Baseline = null!;
+    private static readonly List<string> Report = new();
+    private static int _atlasValues, _gridValues, _gpuPixels, _thumbnailPixels;
+
+    private static int Main(string[] args)
+    {
+        Baseline = Assembly.LoadFrom(args[0]);
+        var output = Path.GetFullPath(args[3]);
+        Directory.CreateDirectory(output);
+        Report.Add("Historical cloud baseline: " + args[4]);
+        Report.Add("Baseline compiled from the original git source; comparisons use its actual executable methods.");
+        using var game = new Game();
+        using var graphics = new GraphicsDeviceManager(game)
+        {
+            PreferredBackBufferWidth = 640, PreferredBackBufferHeight = 360,
+            PreferredDepthStencilFormat = DepthFormat.None, SynchronizeWithVerticalRetrace = false
+        };
+        ((IGraphicsDeviceManager)graphics).CreateDevice();
+        AssertHidden(game.Window.Handle);
+        try
+        {
+            VerifySystemCloudSource(args[1], args[2]);
+            var fixtures = Fixtures();
+            foreach (var (label, key) in fixtures)
+            {
+                VerifyCloudGrid(label, key);
+                VerifyCloseClouds(label, key, graphics.GraphicsDevice);
+            }
+            foreach (var (label, key) in fixtures.Take(3))
+                VerifySystemCloudMask(label, key, graphics.GraphicsDevice);
+            AssertHidden(game.Window.Handle);
+            Report.Add($"PASS: {_atlasValues} close-view cloud atlas floats match bit-for-bit, including original dimensions.");
+            Report.Add($"PASS: {_gridValues} legacy projection grid codes and all frame dimensions/offsets match exactly.");
+            Report.Add($"PASS: {_gpuPixels} uploaded GPU cloud texels match exactly across seeds, clipping, dimensions, animation, Active/Perlin settings and opacity changes.");
+            Report.Add($"PASS: {_thumbnailPixels} thumbnail cloud masks match the historical GPU render; original thumbnail cloud generation/compositing source is unchanged.");
+            Report.Add("PASS: hidden SDL window throughout. Planet atmosphere/composition edits leave cloud fields and GPU cloud pixels unchanged.");
+            return 0;
+        }
+        catch (Exception error)
+        {
+            Report.Add("FAIL: " + error);
+            return 1;
+        }
+        finally
+        {
+            CloudRenderSettings.LightAlpha = .83f;
+            CloudRenderSettings.DarkAlpha = .58f;
+            File.WriteAllLines(Path.Combine(output, "report.txt"), Report);
+            foreach (var line in Report) Console.WriteLine(line);
+        }
+    }
+
+    private static (string Label, PlanetKey Key)[] Fixtures()
+    {
+        var normal = PlanetParams.Default;
+        var small = normal with
+        {
+            PlanetRadiusPx = 14, CellSize = 4, CloudCellSize = 1, CloudMargin = 2,
+            CloudGridMarginPx = 38, CloudScale = .017f, CloudOctaves = 4,
+            CloudLacunarity = 1.6f, CloudPersistence = .8f, CloudThreshold = .43f,
+            CloudSpeed = new Vector2(-.08f, .12f)
+        };
+        var large = normal with
+        {
+            PlanetRadiusPx = 100, CellSize = 1, CloudCellSize = 4, CloudMargin = 11,
+            CloudGridMarginPx = 73, CloudScale = .049f, CloudOctaves = 5,
+            CloudLacunarity = .8f, CloudPersistence = .95f, CloudThreshold = .62f,
+            CloudSpeed = new Vector2(.17f, -.06f)
+        };
+        return new[]
+        {
+            ("default", new PlanetKey(987654321, PlanetPaletteType.Standard, normal)),
+            ("minimum atlas", new PlanetKey(-1741, PlanetPaletteType.Oceanic, small)),
+            ("maximum atlas + raw noise controls", new PlanetKey(42, PlanetPaletteType.Sterile, large)),
+            ("airless override", new PlanetKey(987654321, PlanetPaletteType.Standard, normal)
+                { Environment = new PlanetEnvironment { Atmosphere = 0, Water = 0, Carbon = 1, Iron = 0, Silicates = 0 } }),
+            ("wet volcanic override", new PlanetKey(987654321, PlanetPaletteType.Standard, normal)
+                { Environment = new PlanetEnvironment { Atmosphere = 1, Water = 1, Volcanism = 1, Greenhouse = 1 } })
+        };
+    }
+
+    private static object OldKey(PlanetKey key)
+    {
+        var paramsType = Baseline.GetType("MonogameAS.Planet.PlanetParams")!;
+        var constructor = paramsType.GetConstructors().OrderByDescending(c => c.GetParameters().Length).First();
+        var values = constructor.GetParameters().Select(p => typeof(PlanetParams)
+            .GetProperty(p.Name!, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)!.GetValue(key.Params)).ToArray();
+        var parameters = constructor.Invoke(values);
+        return Activator.CreateInstance(Baseline.GetType("MonogameAS.Planet.PlanetKey")!, key.Seed,
+            Enum.ToObject(Baseline.GetType("MonogameAS.Planet.PlanetPaletteType")!, (int)key.Palette), parameters)!;
+    }
+
+    private static void VerifyCloudGrid(string label, PlanetKey key)
+    {
+        var oldKey = OldKey(key);
+        var method = Baseline.GetType("MonogameAS.Planet.PlanetGenerator")!.GetMethods()
+            .Single(m => m.Name == "GenerateCloudsFrame" && m.GetParameters()[0].ParameterType == oldKey.GetType());
+        foreach (var clip in new[] { true, false })
+        foreach (var offset in new[] { Vector2.Zero, new Vector2(.8f, -.3f), new Vector2(-4.2f, 7.3f) })
+        {
+            var viewport = clip ? new Point(640, 360) : new Point(913, 507);
+            var current = PlanetGenerator.GenerateCloudsFrame(key, key.Params.PlanetRadiusPx, viewport, offset, clip);
+            var old = method.Invoke(null, new object[] { oldKey, key.Params.PlanetRadiusPx, viewport, offset, clip })!;
+            foreach (var name in new[] { "CellSize", "Width", "Height", "OffsetX", "OffsetY" })
+                Check(Equals(Prop(current, name), Prop(old, name)), $"{label}: cloud projection {name} differs.");
+            var oldGrid = (int[,])Prop(old, "Grid");
+            for (var y = 0; y < current.Height; y++)
+            for (var x = 0; x < current.Width; x++)
+            {
+                Check(current.Grid[y, x] == oldGrid[y, x], $"{label}: cloud projection differs at {x},{y}, offset {offset}, clip={clip}.");
+                _gridValues++;
+            }
+        }
+    }
+
+    private static void VerifyCloseClouds(string label, PlanetKey key, GraphicsDevice device)
+    {
+        var oldKey = OldKey(key);
+        foreach (var clip in new[] { true, false })
+        {
+            using var old = (IDisposable)Activator.CreateInstance(Baseline.GetType("MonogameAS.Planet.PixelPlanetRenderer")!, device)!;
+            using var current = (IDisposable)Activator.CreateInstance(Current.GetType("MonogameAS.Planet.PixelPlanetRenderer")!, device)!;
+            var oldUpdate = old.GetType().GetMethod("Update")!;
+            var update = current.GetType().GetMethod("Update")!;
+            var light = Vector3.Normalize(new Vector3(.62f, -.35f, .73f));
+            var sunlight = new Color(249, 217, 182);
+            var steps = new[]
+            {
+                (0d, true, true, .83f, .58f), (.04d, true, true, .83f, .58f),
+                (.15d, true, true, .83f, .58f), (.3d, true, false, .83f, .58f),
+                (.45d, false, false, .83f, .58f), (.6d, true, false, .41f, .92f),
+                (1.2d, true, true, .41f, .92f), (7d, true, true, .83f, .58f),
+                (42d, true, true, .83f, .58f), (84d, true, true, .83f, .58f)
+            };
+            foreach (var (seconds, active, move, lightAlpha, darkAlpha) in steps)
+            {
+                var oldSettings = Baseline.GetType("MonogameAS.Planet.CloudRenderSettings")!;
+                oldSettings.GetField("LightAlpha")!.SetValue(null, lightAlpha);
+                oldSettings.GetField("DarkAlpha")!.SetValue(null, darkAlpha);
+                CloudRenderSettings.LightAlpha = lightAlpha;
+                CloudRenderSettings.DarkAlpha = darkAlpha;
+                oldUpdate.Invoke(old, new object[] { oldKey, new Point(640, 340), seconds, light, sunlight, clip, active, move, 0, 0 });
+                update.Invoke(current, new object[] { key, new Point(640, 340), seconds, light, sunlight, clip, active, move, 0, 0 });
+                if (seconds == 0)
+                {
+                    var oldWorld = Field(old, "_world");
+                    Check((int)Prop(oldWorld, "Width") == (int)Field(current, "_cloudWidth")
+                        && (int)Prop(oldWorld, "Height") == (int)Field(current, "_cloudHeight"), $"{label}: cloud atlas dimensions differ.");
+                    var oldMap = (float[])Field(old, "_cloudMap");
+                    var map = (float[])Field(current, "_cloudMap");
+                    Check(oldMap.Length == map.Length, $"{label}: cloud atlas length differs.");
+                    for (var i = 0; i < map.Length; i++)
+                    {
+                        Check(BitConverter.SingleToInt32Bits(map[i]) == BitConverter.SingleToInt32Bits(oldMap[i]),
+                            $"{label}: cloud atlas differs bitwise at {i}.");
+                        _atlasValues++;
+                    }
+                }
+                var oldTexture = (Texture2D)Field(Field(old, "_clouds"), "Texture");
+                var texture = (Texture2D)Field(Field(current, "_clouds"), "Texture");
+                Check(oldTexture.Width == texture.Width && oldTexture.Height == texture.Height, $"{label}: cloud layer geometry differs.");
+                var oldPixels = Pixels(oldTexture);
+                var pixels = Pixels(texture);
+                Check(pixels.SequenceEqual(oldPixels), $"{label}: GPU cloud texels differ at t={seconds}, clip={clip}, active={active}, move={move}.");
+                _gpuPixels += pixels.Length;
+            }
+            Report.Add($"PASS {label}, clip={clip}: exact atlas + GPU cloud layer at ten animation/settings states.");
+        }
+    }
+
+    private static void VerifySystemCloudMask(string label, PlanetKey key, GraphicsDevice device)
+    {
+        // Compare actual cloud-on/cloud-off GPU changes. Surface colors are allowed
+        // to differ between generations; no terrain cells or samples are replaced.
+        var clearKey = key with { Params = key.Params with { CloudThreshold = 2 } };
+        var typeName = "MonogameAS.Views.SystemView+SystemPlanetSprite";
+        foreach (var tiles in new[] { 12, 32 })
+        {
+            var old = Activator.CreateInstance(Baseline.GetType(typeName)!, device, OldKey(key), tiles)!;
+            var oldClear = Activator.CreateInstance(Baseline.GetType(typeName)!, device, OldKey(clearKey), tiles)!;
+            var current = Activator.CreateInstance(Current.GetType(typeName)!, device, key, tiles)!;
+            var currentClear = Activator.CreateInstance(Current.GetType(typeName)!, device, clearKey, tiles)!;
+            var sprites = new[] { old, oldClear, current, currentClear };
+            try
+            {
+                foreach (var time in new[] { 0d, 12d, 42d, 84d })
+                {
+                    foreach (var sprite in sprites)
+                        sprite.GetType().GetMethod("Update")!.Invoke(sprite, new object[] { time, new Vector2(.5f, -.7f), Color.White });
+                    var oldPixels = Pixels((Texture2D)Prop(old, "Texture"));
+                    var oldClearPixels = Pixels((Texture2D)Prop(oldClear, "Texture"));
+                    var pixels = Pixels((Texture2D)Prop(current, "Texture"));
+                    var clearPixels = Pixels((Texture2D)Prop(currentClear, "Texture"));
+                    for (var i = 0; i < pixels.Length; i++)
+                    {
+                        Check((oldPixels[i] != oldClearPixels[i]) == (pixels[i] != clearPixels[i]),
+                            $"{label}: thumbnail cloud coverage differs at texel {i}, tiles={tiles}, t={time}.");
+                        _thumbnailPixels++;
+                    }
+                }
+            }
+            finally { foreach (var sprite in sprites) ((Texture2D)Prop(sprite, "Texture")).Dispose(); }
+        }
+    }
+
+    private static void VerifySystemCloudSource(string repo, string baselineRoot)
+    {
+        string Extract(string root)
+        {
+            var source = File.ReadAllText(Path.Combine(root, "src", "Views", "SystemView.cs"));
+            var start = source.IndexOf("var cloudLongitude =", StringComparison.Ordinal);
+            var end = source.IndexOf("var diffuse =", start, StringComparison.Ordinal);
+            Check(start >= 0 && end > start, "Cannot locate original thumbnail cloud generation/compositing block.");
+            return Regex.Replace(source[start..end], @"\s+", " ").Trim();
+        }
+        Check(Extract(repo) == Extract(baselineRoot), "Thumbnail cloud generation/compositing no longer matches original source.");
+        Report.Add("PASS: system thumbnail cloud sampling, original noise seed/frequency, drift, thresholds, tint and blend are source-identical to baseline.");
+    }
+
+    private static Color[] Pixels(Texture2D texture)
+    {
+        var data = new Color[texture.Width * texture.Height];
+        texture.GetData(data);
+        return data;
+    }
+    private static object Field(object value, string name) => value.GetType().GetField(name, Fields)!.GetValue(value)!;
+    private static object Prop(object value, string name) => value.GetType().GetProperty(name)!.GetValue(value)!;
+    private static void Check(bool condition, string message)
+    {
+        if (!condition) throw new Exception(message);
+    }
+    private static void AssertHidden(IntPtr window)
+    {
+        var flags = SDL_GetWindowFlags(window);
+        Check((flags & 8) != 0 && (flags & 4) == 0, "Cloud validation window must remain hidden.");
+    }
+    [DllImport("SDL2", CallingConvention = CallingConvention.Cdecl)] private static extern uint SDL_GetWindowFlags(IntPtr window);
+}

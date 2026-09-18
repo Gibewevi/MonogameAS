@@ -23,6 +23,8 @@ public class PlanetView : IView, IDisposable
     private Vector2 _sunPosition;
     private readonly List<DebugSlider> _planetSliders = new();
     private readonly List<DebugSlider> _cloudSliders = new();
+    private readonly List<DebugSlider> _environmentSliders = new();
+    private PlanetEnvironment _debugEnvironment;
     private bool _cloudActive = true;
     private bool _cloudUsePerlin = true;
     private bool _clipToCircle = true;
@@ -72,10 +74,15 @@ public class PlanetView : IView, IDisposable
             _decorationSeed = key.Seed;
         }
         var parameters = key.Params;
+        var initialEnvironment = key.ResolveEnvironment();
+        _debugEnvironment = initialEnvironment;
         if (_showDebug && UpdateDebugUi(_context.ScreenToLogical(mouse.Position), mouse.LeftButton == ButtonState.Pressed,
             previousMouse.LeftButton == ButtonState.Pressed, ref parameters))
         {
             key = key with { Params = parameters };
+            if (_debugEnvironment != initialEnvironment)
+                key = key with { Environment = _debugEnvironment.Normalized() };
+            _debugEnvironment = key.ResolveEnvironment();
             _state.SetPlanetKey(key);
         }
         _seconds = gameTime.TotalGameTime.TotalSeconds;
@@ -117,6 +124,7 @@ public class PlanetView : IView, IDisposable
     {
         if (!_ready)
         {
+            _debugEnvironment = _state.PlanetKey.ResolveEnvironment();
             _seconds = gameTime.TotalGameTime.TotalSeconds;
             UpdateScene(_state.PlanetKey);
         }
@@ -166,6 +174,7 @@ public class PlanetView : IView, IDisposable
     {
         _planetSliders.Clear();
         _cloudSliders.Clear();
+        _environmentSliders.Clear();
 
         _planetSliders.Add(DebugSlider.Float("Radius", 12f, 240f, p => p.PlanetRadiusPx, (p, v) => p with { PlanetRadiusPx = (int)MathF.Round(v) }, isInt: true));
         _planetSliders.Add(DebugSlider.Float("Cell", 1f, 8f, p => p.CellSize, (p, v) => p with { CellSize = Math.Max(1, (int)MathF.Round(v)) }, isInt: true));
@@ -212,6 +221,53 @@ public class PlanetView : IView, IDisposable
             CloudRenderSettings.DarkAlpha = v;
             return p;
         }));
+
+        AddEnvironmentSlider("Orb AU", 0.12f, 20f, e => e.OrbitalDistanceAu, (e, v) => e with { OrbitalDistanceAu = v });
+        AddEnvironmentSlider("Etoile", 0.02f, 20f, e => e.StellarLuminosity, (e, v) => e with { StellarLuminosity = v });
+        AddEnvironmentSlider("Atmo", 0f, 1f, e => e.Atmosphere, (e, v) => e with { Atmosphere = v });
+        AddEnvironmentSlider("Serre", 0f, 1f, e => e.Greenhouse, (e, v) => e with { Greenhouse = v });
+        AddEnvironmentSlider("Eau", 0f, 1f, e => e.Water, (e, v) => e with { Water = v });
+        AddEnvironmentSlider("Sel", 0f, 1f, e => e.Salinity, (e, v) => e with { Salinity = v });
+        AddEnvironmentSlider("Volcan", 0f, 1f, e => e.Volcanism, (e, v) => e with { Volcanism = v });
+        AddEnvironmentSlider("Plaques", 0f, 1f, e => e.Tectonics, (e, v) => e with { Tectonics = v });
+        AddEnvironmentSlider("Age Gyr", 0.02f, 12f, e => e.AgeGyr, (e, v) => e with { AgeGyr = v });
+        AddEnvironmentSlider("Impacts", 0f, 1f, e => e.Impacts, (e, v) => e with { Impacts = v });
+        AddEnvironmentSlider("Erosion", 0f, 1f, e => e.Erosion, (e, v) => e with { Erosion = v });
+        AddEnvironmentSlider("Axe", 0f, 90f, e => e.AxialTilt, (e, v) => e with { AxialTilt = v });
+        AddEnvironmentSlider("Fer", 0f, 1f, e => e.Iron, (e, v) => AdjustComposition(e, 0, v));
+        AddEnvironmentSlider("Silicate", 0f, 1f, e => e.Silicates, (e, v) => AdjustComposition(e, 1, v));
+        AddEnvironmentSlider("Carbone", 0f, 1f, e => e.Carbon, (e, v) => AdjustComposition(e, 2, v));
+        AddEnvironmentSlider("Vie", 0f, 1f, e => e.LifePotential, (e, v) => e with { LifePotential = v });
+        AddEnvironmentSlider("Cont", 0.7f, 5f, e => e.ContinentalScale, (e, v) => e with { ContinentalScale = v });
+        AddEnvironmentSlider("Relief", 0f, 1f, e => e.Relief, (e, v) => e with { Relief = v });
+    }
+
+    private void AddEnvironmentSlider(string label, float min, float max,
+        Func<PlanetEnvironment, float> getter, Func<PlanetEnvironment, float, PlanetEnvironment> setter)
+    {
+        _environmentSliders.Add(DebugSlider.Float(label, min, max, _ => getter(_debugEnvironment), (p, value) =>
+        {
+            _debugEnvironment = setter(_debugEnvironment, value);
+            return p;
+        }));
+    }
+
+    private static PlanetEnvironment AdjustComposition(PlanetEnvironment environment, int component, float value)
+    {
+        // Keep the selected mineral at the slider value, distributing the remaining
+        // composition in the same ratio as before the edit.
+        var iron = component == 0 ? 0 : environment.Iron;
+        var silicates = component == 1 ? 0 : environment.Silicates;
+        var carbon = component == 2 ? 0 : environment.Carbon;
+        var total = iron + silicates + carbon;
+        var remaining = 1f - value;
+        var scale = total > 0 ? remaining / total : 0;
+        return environment with
+        {
+            Iron = component == 0 ? value : total > 0 ? iron * scale : remaining * 0.5f,
+            Silicates = component == 1 ? value : total > 0 ? silicates * scale : remaining * 0.5f,
+            Carbon = component == 2 ? value : total > 0 ? carbon * scale : remaining * 0.5f
+        };
     }
 
     private bool UpdateDebugUi(Point mouse, bool leftDown, bool leftPrev, ref PlanetParams p)
@@ -226,10 +282,7 @@ public class PlanetView : IView, IDisposable
         var panel = new Rectangle(DebugPanelGap, panelY, panelWidth, panelHeight);
         var changed = false;
         changed |= UpdateTabPanel(panel, mouse, leftDown, leftPrev);
-        if (_activeTab == DebugTab.Planet)
-            changed |= UpdateSliderPanel(_planetSliders, panel, mouse, leftDown, leftPrev, ref p);
-        else
-            changed |= UpdateSliderPanel(_cloudSliders, panel, mouse, leftDown, leftPrev, ref p);
+        changed |= UpdateSliderPanel(ActiveSliders, panel, mouse, leftDown, leftPrev, ref p);
         if (_clipDirty)
         {
             _clipDirty = false;
@@ -274,10 +327,7 @@ public class PlanetView : IView, IDisposable
         DrawRectOutline(sb, _context.Pixel, panel, outline);
 
         DrawTabs(sb, panel);
-        if (_activeTab == DebugTab.Planet)
-            DrawSliderPanel(sb, _planetSliders, panel, p);
-        else
-            DrawSliderPanel(sb, _cloudSliders, panel, p);
+        DrawSliderPanel(sb, ActiveSliders, panel, p);
     }
 
     private void DrawSliderPanel(SpriteBatch sb, List<DebugSlider> sliders, Rectangle panel, PlanetParams p)
@@ -298,9 +348,16 @@ public class PlanetView : IView, IDisposable
         }
     }
 
+    private List<DebugSlider> ActiveSliders => _activeTab switch
+    {
+        DebugTab.Planet => _planetSliders,
+        DebugTab.Clouds => _cloudSliders,
+        _ => _environmentSliders
+    };
+
     private int GetDebugPanelHeight()
     {
-        var activeCount = _activeTab == DebugTab.Planet ? _planetSliders.Count : _cloudSliders.Count;
+        var activeCount = ActiveSliders.Count;
         var rows = Math.Max(1, (int)MathF.Ceiling(activeCount / 2f));
         return DebugPanelTitleHeight + DebugPanelPadding * 2 + DebugTabHeight + rows * DebugSliderRowHeight;
     }
@@ -319,14 +376,8 @@ public class PlanetView : IView, IDisposable
         if (!leftDown || leftPrev || !tabArea.Contains(mouse))
             return false;
 
-        var tabWidth = tabArea.Width / 2;
-        var planetRect = new Rectangle(tabArea.X, tabArea.Y, tabWidth, tabArea.Height);
-        var cloudRect = new Rectangle(tabArea.X + tabWidth, tabArea.Y, tabWidth, tabArea.Height);
-
-        if (planetRect.Contains(mouse))
-            _activeTab = DebugTab.Planet;
-        else if (cloudRect.Contains(mouse))
-            _activeTab = DebugTab.Clouds;
+        var tabWidth = Math.Max(1, tabArea.Width / 3);
+        _activeTab = (DebugTab)Math.Clamp((mouse.X - tabArea.X) / tabWidth, 0, 2);
 
         return true;
     }
@@ -334,23 +385,27 @@ public class PlanetView : IView, IDisposable
     private void DrawTabs(SpriteBatch sb, Rectangle panel)
     {
         var tabArea = new Rectangle(panel.X + DebugPanelPadding, panel.Y + DebugPanelTitleHeight + 2, panel.Width - DebugPanelPadding * 2, DebugTabHeight);
-        var tabWidth = Math.Max(1, tabArea.Width / 2);
+        var tabWidth = Math.Max(1, tabArea.Width / 3);
         var planetRect = new Rectangle(tabArea.X, tabArea.Y, tabWidth, tabArea.Height);
         var cloudRect = new Rectangle(tabArea.X + tabWidth, tabArea.Y, tabWidth, tabArea.Height);
+        var environmentRect = new Rectangle(tabArea.X + tabWidth * 2, tabArea.Y, tabArea.Width - tabWidth * 2, tabArea.Height);
 
         var inactive = new Color(97, 120, 150) * 0.15f;
         var active = new Color(97, 145, 180) * 0.4f;
         sb.Draw(_context.Pixel, planetRect, _activeTab == DebugTab.Planet ? active : inactive);
         sb.Draw(_context.Pixel, cloudRect, _activeTab == DebugTab.Clouds ? active : inactive);
+        sb.Draw(_context.Pixel, environmentRect, _activeTab == DebugTab.Environment ? active : inactive);
 
         sb.DrawString(_context.Font, "Planete", new Vector2(planetRect.X + 6, planetRect.Y + 2), new Color(220, 220, 220) * 0.8f, 0f, Vector2.Zero, DebugTextScale, SpriteEffects.None, 0f);
         sb.DrawString(_context.Font, "Nuages", new Vector2(cloudRect.X + 6, cloudRect.Y + 2), new Color(220, 220, 220) * 0.8f, 0f, Vector2.Zero, DebugTextScale, SpriteEffects.None, 0f);
+        sb.DrawString(_context.Font, "Milieu", new Vector2(environmentRect.X + 6, environmentRect.Y + 2), new Color(220, 220, 220) * 0.8f, 0f, Vector2.Zero, DebugTextScale, SpriteEffects.None, 0f);
     }
 
     private enum DebugTab
     {
         Planet,
-        Clouds
+        Clouds,
+        Environment
     }
 
     private sealed class DebugSlider
@@ -393,8 +448,9 @@ public class PlanetView : IView, IDisposable
                 var value = Min + (Max - Min) * t;
                 if (IsInt)
                     value = MathF.Round(value);
+                var previousValue = Getter(p);
                 var updated = Setter(p, value);
-                if (!updated.Equals(p))
+                if (!updated.Equals(p) || Getter(updated) != previousValue)
                 {
                     p = updated;
                     return true;

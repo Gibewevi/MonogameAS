@@ -19,6 +19,13 @@ public sealed class SystemGenerator
 
         var planets = new List<PlanetOrbital>(count);
 
+        // Scene distances are layout units, not AU. Compress stellar luminosity
+        // and orbital extent for an expressive, readable range of small game worlds.
+        var starTemperature = sun.Celsus >= 1000 ? sun.Celsus : 3200f + Math.Clamp(sun.ClassId, 0, 6) * 1700f;
+        var starSize = Math.Clamp(sun.Size / 12f, 0.5f, 2.5f);
+        var luminosity = Math.Clamp(MathF.Pow(starTemperature / 5800f, 0.65f) * MathF.Pow(starSize, 0.35f), 0.65f, 1.85f);
+        var orbitUnit = Math.Max(1f, p.OrbitalSpacing + (p.PlanetRadiusMin + p.PlanetRadiusMax) * 0.5f + p.CollisionGap);
+
         float previousA = 0f;
         float previousR = 0f;
 
@@ -40,7 +47,12 @@ public sealed class SystemGenerator
             if (scaledRadius < planetParams.CellSize)
                 scaledRadius = planetParams.CellSize;
             var scaledParams = planetParams with { PlanetRadiusPx = scaledRadius };
-            var planetKey = new PlanetKey(planetSeed, palette, scaledParams);
+            var orbitPosition = Math.Max(0f, (semiMajor - p.SemiMajorMin) / orbitUnit);
+            var orbitalDistanceAu = 0.62f + 0.5f * MathF.Log(1f + orbitPosition);
+            var planetKey = new PlanetKey(planetSeed, palette, scaledParams)
+            {
+                Environment = PlanetEnvironment.Generate(planetSeed, orbitalDistanceAu, luminosity)
+            };
 
             planets.Add(new PlanetOrbital
             {

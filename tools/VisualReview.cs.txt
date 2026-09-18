@@ -17,7 +17,7 @@ using MonogameAS.Views;
 using MonogameAS.Screens;
 
 // Compiled by Test-Visuals.ps1 in a temporary project, never into the game.
-internal static class Program
+internal static partial class Program
 {
     private const int Width = 640;
     private const int Height = 360;
@@ -63,6 +63,7 @@ internal static class Program
             var skyOnly = args.Length > 2 && args[2] == "sky";
             var systemOnly = args.Length > 2 && args[2] == "system";
             var planetRestoreOnly = args.Length > 2 && args[2] == "planet-restore";
+            var systemicOnly = args.Length > 2 && args[2] == "planet-systemic";
             var galaxyOnly = args.Length > 2 && args[2] is "galaxy" or "galaxy-baseline" or "galaxy-solar";
             if (galaxyOnly) CaptureGalaxyBaseline(device, target, context, output, report);
             if (args.Length > 2 && args[2] is "galaxy" or "galaxy-solar")
@@ -72,7 +73,14 @@ internal static class Program
             }
             if (args.Length > 2 && args[2] == "galaxy-solar")
                 ValidateGalaxySolar(device, target, context, output, report);
-            if (!skyOnly && !systemOnly && !galaxyOnly)
+            if (systemicOnly)
+            {
+                ValidateSystemicPlanets(device, context, output, report);
+                ValidatePlanetControls(device, target, context, output, report);
+                ValidateEditedWorldNavigation(context, report);
+                CaptureNavigation(device, target, context, output, report);
+            }
+            if (!skyOnly && !systemOnly && !galaxyOnly && !systemicOnly)
             {
             if (!baseline) ValidateTerrain(report);
             var cases = baseline
@@ -101,7 +109,7 @@ internal static class Program
             if (!baseline) ValidatePlanetControls(device, target, context, output, report);
             if (!baseline && !planetRestoreOnly) ValidateEditedWorldNavigation(context, report);
             }
-            if (!baseline && !systemOnly && !planetRestoreOnly && !galaxyOnly) ValidatePlanetSky(device, target, context, output, report);
+            if (!baseline && !systemOnly && !planetRestoreOnly && !galaxyOnly && !systemicOnly) ValidatePlanetSky(device, target, context, output, report);
             if (systemOnly)
             {
                 ValidateSystemSky(device, target, context, output, report);
@@ -182,12 +190,12 @@ internal static class Program
 
     private static void ValidateTerrain(List<string> report)
     {
-        foreach (var palette in new[] { PlanetPaletteType.Oceanic, PlanetPaletteType.Standard, PlanetPaletteType.Sterile })
+        foreach (var seed in new[] { 987654321, 12345, 42 })
         {
-            var key = new PlanetKey(987654321, palette, PlanetParams.Default);
+            var key = new PlanetKey(seed, PlanetPaletteType.Standard, PlanetParams.Default);
             var map = new PlanetWorldMap(key);
             var copy = new PlanetWorldMap(key);
-            var anotherSeed = new PlanetWorldMap(key with { Seed = 12345 });
+            var anotherSeed = new PlanetWorldMap(key with { Seed = seed + 1 });
             var codes = new HashSet<int>();
             var seedDifferences = 0;
             var longitudeDifferences = 0;
@@ -198,12 +206,12 @@ internal static class Program
                     var u = (x + 0.37f) / map.Width;
                     var v = (y + 0.37f) / map.Height;
                     var code = map.SampleUv(u, v);
+                    var cell = map.SampleCellUv(u, v);
                     codes.Add(code);
-                    if (code is not (10 or 11 or 12 or 13 or 20 or 21)) throw new Exception("Unexpected legacy terrain code.");
-                    if (!map.Palette.HasBeaches && code == 11) throw new Exception("Sterile terrain unexpectedly contains a beach.");
-                    if (code != copy.SampleUv(u, v)) throw new Exception("Terrain generation is not deterministic.");
-                    if (code != anotherSeed.SampleUv(u, v)) seedDifferences++;
-                    if (code != map.SampleUv(u + 0.25f, v)) longitudeDifferences++;
+                    if (!Enum.IsDefined((PlanetTerrain)code)) throw new Exception("Unexpected systemic terrain code.");
+                    if (!cell.Equals(copy.SampleCellUv(u, v))) throw new Exception("Terrain generation is not deterministic.");
+                    if (!cell.Equals(anotherSeed.SampleCellUv(u, v))) seedDifferences++;
+                    if (!cell.Equals(map.SampleCellUv(u + 0.25f, v))) longitudeDifferences++;
                     foreach (var turns in new[] { -4f, -1f, 1f, 4f })
                         if (code != map.SampleUv(u + turns, v)) throw new Exception("Longitude failed to wrap.");
                     var longitude = (u - 0.5f) * MathHelper.TwoPi;
@@ -218,9 +226,11 @@ internal static class Program
                 for (var x = -20; x <= 20; x++)
                     if (map.ColorFor(map.Sample(x * 1.13f, latitude)).A != 255)
                         throw new Exception("Invalid polar sample.");
-            if (codes.Count < 3 || seedDifferences < map.Width * map.Height / 20 || longitudeDifferences < map.Width * map.Height / 20)
+            // A completely frozen or ocean-covered world may legitimately have
+            // few materials; the retained environmental fields must still vary.
+            if (seedDifferences < map.Width * map.Height / 20 || longitudeDifferences < map.Width * map.Height / 20)
                 throw new Exception("Terrain variation is insufficient.");
-            report.Add($"PASS {palette}: {map.Width}x{map.Height} stable atlas; {codes.Count} terrain codes; deterministic generation, seed variation, full longitude wrapping including negative turns, valid poles, opaque terrain.");
+            report.Add($"PASS seed {seed}: {map.Width}x{map.Height} stable atlas; {codes.Count} terrain codes; deterministic generation, field variation between seeds/longitudes, full longitude wrapping including negative turns, valid poles, opaque terrain.");
         }
     }
 
@@ -240,7 +250,7 @@ internal static class Program
                 for (var x = 0; x < world.Width; x++)
                 {
                     var code = world.SampleUv((x + .37f) / world.Width, (y + .37f) / world.Height);
-                    var color = world.ColorFor(code);
+                    var color = world.SampleColorUv((x + .37f) / world.Width, (y + .37f) / world.Height);
                     pixels[y * world.Width + x] = color;
                     writer.Write(code);
                     writer.Write(color.PackedValue);
@@ -357,14 +367,17 @@ internal static class Program
         const double period = 84;
         var quarter = SurfaceAt(period / 4d);
         var complete = SurfaceAt(period);
+        SurfaceAt(period * .75d);
+        var rewound = SurfaceAt(0);
         var moved = 0;
         for (var i = 0; i < initial.Length; i++)
         {
             if (initial[i] != quarter[i]) moved++;
             if (initial[i] != complete[i]) throw new Exception("Terrain GPU pixels changed after a complete revolution.");
+            if (initial[i] != rewound[i]) throw new Exception("Rewinding animation time left stale terrain GPU pixels.");
         }
         if (moved < initial.Length / 20) throw new Exception("Terrain does not move during the quarter revolution.");
-        report.Add($"PASS: F3, actual Rings/Moons/Clip slider clicks, 0/3 decorations, full map corners; GPU surface quarter-turn changes {moved} pixels and full {period:0.00}-second revolution is pixel-identical with fixed lighting.");
+        report.Add($"PASS: F3, actual Rings/Moons/Clip slider clicks, 0/3 decorations, full map corners; GPU surface quarter-turn changes {moved} pixels; full {period:0.00}-second revolution and backward time seek are pixel-identical with fixed lighting.");
 
         void SaveView(string name)
         {
@@ -1686,6 +1699,29 @@ La génération et l'identité des systèmes sont conservées. <a href="report.t
         screen.Update(time, NoMouse, edit);
         var edited = state.PlanetKey;
         if (edited.Params.ElevSeaLevel == original.Params.ElevSeaLevel) throw new Exception("Actual Sea slider click did not edit the selected world.");
+        // Edit a physical characteristic through the actual third F3 tab as well.
+        var environmentTab = new MouseState(Width - 70, Height - height + 23, 0, ButtonState.Pressed,
+            ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+        screen.Update(time, environmentTab, NoMouse);
+        screen.Update(time, NoMouse, environmentTab);
+        var environmentSliders = (IList)Field(planetView, "_environmentSliders");
+        var environmentIndex = -1;
+        for (var i = 0; i < environmentSliders.Count; i++)
+            if ((string)environmentSliders[i]!.GetType().GetProperty("Label")!.GetValue(environmentSliders[i])! == "Eau") environmentIndex = i;
+        if (environmentIndex < 0) throw new Exception("Environment Water slider is missing.");
+        height = (int)planetView.GetType().GetMethod("GetDebugPanelHeight", BindingFlags.Instance | BindingFlags.NonPublic)!.Invoke(planetView, null)!;
+        rows = (environmentSliders.Count + 1) / 2;
+        row = new Rectangle(14 + environmentIndex / rows * (columnWidth + 8), Height - height + 38 + environmentIndex % rows * 20, columnWidth, 20);
+        track = (Rectangle)environmentSliders[environmentIndex]!.GetType().GetMethod("MakeTrackRect")!.Invoke(null, new object[] { row, 60, 32 })!;
+        var waterBefore = edited.ResolveEnvironment().Water;
+        var waterX = waterBefore < .5f ? track.Right - 2 : track.Left + 2;
+        edit = new MouseState(waterX, track.Center.Y, 0, ButtonState.Pressed,
+            ButtonState.Released, ButtonState.Released, ButtonState.Released, ButtonState.Released);
+        screen.Update(time, edit, NoMouse);
+        screen.Update(time, NoMouse, edit);
+        edited = state.PlanetKey;
+        if (edited.ResolveEnvironment().Water == waterBefore || !edited.Environment.HasValue)
+            throw new Exception("Actual environment Water slider did not persist the changed environment.");
         Tab(65);
         callback.Invoke(screen, new object[] { sunB });
         Tab(190);
@@ -1705,7 +1741,7 @@ La génération et l'identité des systèmes sont conservées. <a href="report.t
                 found = true;
             }
         if (!found) throw new Exception("Returned system no longer contains the edited world.");
-        report.Add("PASS: actual F3 Sea slider edit survives Planet A -> Galaxy -> System B -> System A, including its palette and parameters; edits do not leak into system B.");
+        report.Add("PASS: actual F3 Sea and environment Water slider edits survive Planet A -> Galaxy -> System B -> System A, including the full environment and parameters; edits do not leak into system B.");
     }
 
     private sealed class DeviceService(GraphicsDevice graphicsDevice) : IGraphicsDeviceService

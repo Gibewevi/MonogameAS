@@ -1,4 +1,7 @@
-﻿2026-01-22 00:43:41.162 [INFO] Logger initialized
-2026-01-22 00:43:41.516 [INFO] Switching to MainMenuScreen
-2026-01-22 00:43:44.335 [INFO] MainMenu: Nouvelle partie clicked
-2026-01-22 00:43:44.335 [INFO] Starting new game -> GameScreen
+﻿2026-09-18 01:03:38.431 [INFO] Logger initialized
+2026-09-18 01:03:38.527 [INFO] Switching to MainMenuScreen
+2026-09-18 01:03:39.379 [INFO] MainMenu: Nouvelle partie clicked
+2026-09-18 01:03:39.379 [INFO] Starting new game -> GameScreen
+2026-09-18 01:04:03.324 [INFO] [SystemView] System regen seed=12985615 planets=3
+2026-09-18 01:04:14.247 [INFO] [SystemView] Planet selected seed=765224646
+2026-09-18 01:04:27.146 [INFO] [SystemView] Planet selected seed=764954343

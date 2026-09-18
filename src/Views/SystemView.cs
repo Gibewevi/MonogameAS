@@ -561,7 +561,8 @@ public class SystemView : IView, IDisposable
                 if (normal == Vector3.Zero) continue;
                 var coordinates = _coordinates[i];
                 var longitude = coordinates.X + rotation;
-                var color = _world.ColorFor(_world.Sample(longitude, coordinates.Y));
+                var terrain = _world.SampleCell(longitude, coordinates.Y).Terrain;
+                var color = _world.SampleColor(longitude, coordinates.Y);
                 var cloudLongitude = longitude + (float)seconds * 0.006f;
                 var cosLatitude = MathF.Cos(coordinates.Y);
                 var cloudPosition = new Vector3(MathF.Sin(cloudLongitude) * cosLatitude,
@@ -569,13 +570,10 @@ public class SystemView : IView, IDisposable
                 var clouds = SphereNoise.Fractal(cloudPosition * 4.2f, _key.Seed ^ 0x01ca713d, 2, 2.5f, 0.48f);
                 if (clouds > _key.Params.CloudThreshold + 0.07f)
                     color = Color.Lerp(color, new Color(234, 241, 247), clouds > _key.Params.CloudThreshold + 0.17f ? 0.62f : 0.32f);
+                color = PixelPlanetRenderer.ShadeTerrain(color, terrain, normal, direction, sunlight);
                 var diffuse = MathF.Max(0, Vector3.Dot(normal, direction));
-                diffuse = MathF.Round(diffuse * 4f) / 4f;
-                var dayColor = Color.Lerp(color, sunlight, diffuse * 0.08f);
-                var nightColor = Color.Lerp(new Color(color.ToVector3() * 0.43f), new Color(29, 28, 51), 0.22f);
-                color = Color.Lerp(nightColor, dayColor, 0.15f + diffuse * 0.85f);
                 if (normal.Z < 0.45f && diffuse > 0.2f)
-                    color = Color.Lerp(color, new Color(154, 207, 216), 0.2f);
+                    color = Color.Lerp(color, _world.Palette.Atmosphere, 0.2f * _world.AtmosphereStrength);
                 _pixels[i] = color;
             }
             Texture.SetData(_pixels);

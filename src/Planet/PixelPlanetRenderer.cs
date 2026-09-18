@@ -25,6 +25,8 @@ internal sealed class PixelPlanetRenderer : IDisposable
     private Color[] _ringFrontPixels = Array.Empty<Color>();
     private RingPixel[] _ringPixels = Array.Empty<RingPixel>();
     private float[] _cloudMap = Array.Empty<float>();
+    private int _cloudWidth;
+    private int _cloudHeight;
     private readonly Moon[] _moons = new Moon[3];
     private double _lastFrame = double.NegativeInfinity;
     private double _previousTime;
@@ -51,7 +53,8 @@ internal sealed class PixelPlanetRenderer : IDisposable
     {
         var ringCount = rings < 0 ? (int)((uint)key.Seed / 7u % 4u) : rings;
         var moonCount = moons < 0 ? 1 + (int)((uint)key.Seed / 11u % 2u) : moons;
-        var rebuild = !_ready || key != _key || viewport != _viewport || clipToCircle != _clip || ringCount != RingCount || moonCount != MoonCount;
+        var newWorld = !_ready || key != _key;
+        var rebuild = newWorld || viewport != _viewport || clipToCircle != _clip || ringCount != RingCount || moonCount != MoonCount;
         if (rebuild)
             Configure(key, viewport, clipToCircle, ringCount, moonCount);
 
@@ -62,7 +65,7 @@ internal sealed class PixelPlanetRenderer : IDisposable
         _time = seconds;
         _cloudActive = cloudsActive;
         var settings = HashCode.Combine(cloudsActive, cloudsMove, CloudRenderSettings.LightAlpha, CloudRenderSettings.DarkAlpha);
-        if (!rebuild && settings == _lastSettings && seconds - _lastFrame < 1.0 / 12.0)
+        if (!rebuild && settings == _lastSettings && seconds >= _lastFrame && seconds - _lastFrame < 1.0 / 12.0)
             return;
         _lastFrame = seconds;
         _lastSettings = settings;
@@ -82,7 +85,10 @@ internal sealed class PixelPlanetRenderer : IDisposable
         if (newWorld)
         {
             _world = PlanetWorldMap.GetOrGenerate(key);
-            _cloudMap = new float[_world.Width * _world.Height];
+            // Preserve the original cloud grid independently of the canonical terrain atlas.
+            _cloudWidth = Math.Clamp((int)MathF.Ceiling(MathHelper.TwoPi * key.Params.PlanetRadiusPx / Math.Max(1, key.Params.CellSize)), 96, 512);
+            _cloudHeight = _cloudWidth / 2;
+            _cloudMap = new float[_cloudWidth * _cloudHeight];
             GenerateCloudAtlas(key);
         }
         DisposeGeometry();
@@ -120,16 +126,16 @@ internal sealed class PixelPlanetRenderer : IDisposable
     {
         var p = key.Params;
         var scale = Math.Max(0.01f, p.PlanetRadiusPx / (float)Math.Max(1, p.CloudCellSize) * p.CloudScale);
-        for (var y = 0; y < _world.Height; y++)
+        for (var y = 0; y < _cloudHeight; y++)
         {
-            var latitude = (0.5f - (y + 0.5f) / _world.Height) * MathHelper.Pi;
+            var latitude = (0.5f - (y + 0.5f) / _cloudHeight) * MathHelper.Pi;
             var cosLatitude = MathF.Cos(latitude);
-            for (var x = 0; x < _world.Width; x++)
+            for (var x = 0; x < _cloudWidth; x++)
             {
-                var longitude = ((x + 0.5f) / _world.Width - 0.5f) * MathHelper.TwoPi;
+                var longitude = ((x + 0.5f) / _cloudWidth - 0.5f) * MathHelper.TwoPi;
                 var point = new Vector3(MathF.Sin(longitude) * cosLatitude, MathF.Sin(latitude), MathF.Cos(longitude) * cosLatitude);
                 var density = SphereNoise.Fractal(point * scale, key.Seed ^ 0x51AB7913, p.CloudOctaves, p.CloudLacunarity, p.CloudPersistence);
-                _cloudMap[y * _world.Width + x] = density;
+                _cloudMap[y * _cloudWidth + x] = density;
             }
         }
     }
@@ -142,9 +148,9 @@ internal sealed class PixelPlanetRenderer : IDisposable
         if (v < 0) { v = -v; u += 0.5f; }
         if (v > 1) { v = 2 - v; u += 0.5f; }
         u -= MathF.Floor(u);
-        var x = Math.Min(_world.Width - 1, (int)(u * _world.Width));
-        var y = Math.Clamp((int)(v * _world.Height), 0, _world.Height - 1);
-        return _cloudMap[y * _world.Width + x];
+        var x = Math.Min(_cloudWidth - 1, (int)(u * _cloudWidth));
+        var y = Math.Clamp((int)(v * _cloudHeight), 0, _cloudHeight - 1);
+        return _cloudMap[y * _cloudWidth + x];
     }
 
     private void UpdateSurface(float rotation, Vector3 light, Color sunlight)
@@ -154,8 +160,8 @@ internal sealed class PixelPlanetRenderer : IDisposable
             if (!_surface.Valid[i]) continue;
             var normal = _surface.Normals[i];
             var uv = _surface.Uv[i];
-            var code = _world.SampleUv(uv.X + rotation, uv.Y);
-            var color = Shade(_world.ColorFor(code), normal, light, sunlight);
+            var terrain = _world.SampleCellUv(uv.X + rotation, uv.Y).Terrain;
+            var color = ShadeTerrain(_world.SampleColorUv(uv.X + rotation, uv.Y), terrain, normal, light, sunlight);
             if (_cloudActive && CloudSample(uv.X + rotation - light.X * 0.016f, uv.Y - light.Y * 0.012f) > _key.Params.CloudThreshold + 0.055f)
                 color = Color.Lerp(color, new Color(21, 29, 52), 0.14f);
             if (_clip && RingCount > 0 && Vector3.Dot(normal, light) > 0 && IsRingShadow(normal, light))
@@ -190,14 +196,14 @@ internal sealed class PixelPlanetRenderer : IDisposable
         for (var i = 0; i < _atmosphere.Pixels.Length; i++)
         {
             _atmosphere.Pixels[i] = Color.Transparent;
-            if (!_clip || !_atmosphere.Valid[i]) continue;
+            if (!_clip || !_atmosphere.Valid[i] || _world.AtmosphereStrength <= 0) continue;
             var normal = _atmosphere.Normals[i];
             var radial = MathF.Sqrt(normal.X * normal.X + normal.Y * normal.Y) * _atmosphere.Radius;
             if (radial < Radius - 1) continue;
             var rimLight = Math.Max(0, Vector3.Dot(new Vector3(normal.X, normal.Y, 0.16f), light));
             var inner = radial < Radius + 2;
-            var alpha = (inner ? 0.30f : 0.07f) * (0.35f + rimLight * 0.9f);
-            var tint = Color.Lerp(new Color(102, 152, 193), sunlight, rimLight * 0.30f);
+            var alpha = (inner ? 0.30f : 0.07f) * (0.35f + rimLight * 0.9f) * _world.AtmosphereStrength;
+            var tint = Color.Lerp(_world.Palette.Atmosphere, sunlight, rimLight * 0.30f);
             _atmosphere.Pixels[i] = tint * alpha;
         }
         _atmosphere.Upload();
@@ -326,6 +332,14 @@ internal sealed class PixelPlanetRenderer : IDisposable
         if (illumination > 0.08f)
             color = Color.Lerp(color, sunlight, 0.035f + Math.Max(0, illumination) * 0.055f);
         return color;
+    }
+
+    internal static Color ShadeTerrain(Color albedo, PlanetTerrain terrain, Vector3 normal, Vector3 light, Color sunlight)
+    {
+        var color = Shade(albedo, normal, light, sunlight);
+        // A gentle emissive component leaves active lava visible beyond the terminator.
+        var emission = terrain == PlanetTerrain.LavaHot ? 0.36f : terrain == PlanetTerrain.Lava ? 0.22f : 0f;
+        return emission > 0 ? Color.Lerp(color, albedo, emission) : color;
     }
 
     private void DisposeGeometry()

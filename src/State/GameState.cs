@@ -29,7 +29,7 @@ public sealed class GameState
     public Planet.PlanetKey RestorePlanet(Planet.PlanetKey generated)
     {
         if (_visitedPlanets.TryGetValue((SystemSeed, generated.Seed), out var visited))
-            return generated with { Params = visited.Params, Palette = visited.Palette };
+            return generated with { Params = visited.Params, Palette = visited.Palette, Environment = visited.Environment ?? generated.Environment };
         return generated;
     }
 

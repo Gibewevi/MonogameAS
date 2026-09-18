@@ -3,141 +3,86 @@ using Microsoft.Xna.Framework;
 
 namespace MonogameAS.Planet;
 
+/// <summary>Small related color ramps, derived from chemistry and climate rather than planet classes.</summary>
 public static class PlanetPaletteFactory
 {
-    private static readonly Random SharedRng = new();
+    public static PlanetPalette Make(PlanetPaletteType type, int seed) => Make(PlanetEnvironment.Generate(seed), seed);
+    public static PlanetPalette MakeSterile() => MakeRandom();
+    public static PlanetPalette MakeOceanic() => MakeRandom();
+    public static PlanetPalette MakeStandard() => MakeRandom();
 
-    public static PlanetPalette Make(PlanetPaletteType type, int seed)
+    public static PlanetPalette Make(PlanetEnvironment environment, int seed)
     {
-        var rng = new Random(HashSeed(seed, type));
-        return type switch
+        var e = environment.Normalized();
+        float Sample(int channel) => SphereNoise.Hash(channel, 977, 223, seed);
+        var warmth = Math.Clamp((e.MeanTemperatureC + 45f) / 125f, 0f, 1f);
+        var hueDrift = (Sample(1) - 0.5f) * 0.045f;
+        var mineralValue = 0.78f - e.Carbon * 0.28f + e.Silicates * 0.08f;
+        var ironMineral = Hsv(0.035f + hueDrift * 0.5f, 0.37f + warmth * 0.05f, mineralValue);
+        var silicateMineral = Hsv(0.43f + hueDrift * 0.5f, 0.22f + e.Silicates * 0.055f, mineralValue);
+        var carbonMineral = Hsv(0.755f + hueDrift * 0.5f, 0.25f, mineralValue * 0.88f);
+        // Continuous pigment mixing gives chemistry a visible signature. Slightly
+        // emphasize dominant minerals so every mixture does not collapse into beige.
+        var ironWeight = MathF.Pow(e.Iron, 1.6f);
+        var silicateWeight = MathF.Pow(e.Silicates, 1.6f);
+        var carbonWeight = MathF.Pow(e.Carbon * 1.3f, 1.6f);
+        var weight = ironWeight + silicateWeight + carbonWeight;
+        var stone = new Color((ironMineral.ToVector3() * ironWeight + silicateMineral.ToVector3() * silicateWeight
+            + carbonMineral.ToVector3() * carbonWeight) / weight);
+        var sand = Color.Lerp(stone, Hsv(0.12f + hueDrift, 0.36f, 0.90f), 0.44f + e.Salinity * 0.18f);
+        var waterHue = 0.55f - e.Salinity * 0.06f + e.Carbon * 0.04f + hueDrift * 0.5f;
+        var waterSaturation = 0.38f + e.Iron * 0.16f;
+        var deep = Hsv(waterHue + 0.012f, waterSaturation + 0.1f, 0.62f + Sample(3) * 0.07f);
+        var shelf = Hsv(waterHue - 0.012f, waterSaturation, 0.80f + Sample(3) * 0.04f);
+        var vegetation = Hsv(0.27f + (1f - warmth) * 0.09f + hueDrift, 0.32f + e.LifePotential * 0.19f, 0.73f + Sample(4) * 0.09f);
+        var plains = Color.Lerp(stone, vegetation, Math.Clamp(e.LifePotential * 1.7f, 0f, 0.92f));
+        var mountains = Color.Lerp(stone, Hsv(0.66f + hueDrift, 0.2f, 0.62f), 0.43f);
+        var ice = Hsv(waterHue - 0.012f, 0.21f, 0.90f);
+        var snow = Color.Lerp(Hsv(waterHue, 0.08f, 0.98f), sand, 0.055f * e.Iron);
+        var basalt = Color.Lerp(Hsv(0.69f + hueDrift, 0.19f, 0.40f), stone, 0.19f);
+        var atmosphere = Color.Lerp(Hsv(waterHue, 0.24f, 0.91f), sand, e.Greenhouse * e.Iron * 0.72f);
+        return new PlanetPalette(deep, shelf, sand, plains,
+            Color.Lerp(plains, mountains, 0.52f), mountains, e.Water > 0.03f)
         {
-            PlanetPaletteType.Oceanic => MakeOceanic(rng),
-            PlanetPaletteType.Sterile => MakeSterile(rng),
-            PlanetPaletteType.Standard => MakeStandard(rng),
-            _ => MakeStandard(rng)
+            DryPlain = Color.Lerp(stone, sand, 0.22f),
+            Desert = sand,
+            Forest = Color.Lerp(vegetation, Hsv(0.40f + hueDrift, 0.44f, 0.56f), 0.35f),
+            Snow = snow,
+            Ice = ice,
+            Glacier = Color.Lerp(ice, shelf, 0.28f),
+            Basalt = basalt,
+            Lava = Hsv(0.025f + e.Iron * 0.035f, 0.68f, 0.95f),
+            LavaHot = Hsv(0.12f, 0.42f, 1f),
+            CraterFloor = Color.Lerp(stone, basalt, 0.42f),
+            CraterRim = Color.Lerp(stone, sand, 0.45f),
+            SaltFlat = Color.Lerp(sand, snow, 0.65f),
+            Atmosphere = atmosphere
         };
     }
 
-    public static PlanetPalette MakeSterile() => MakeSterile(SharedRng);
-    public static PlanetPalette MakeOceanic() => MakeOceanic(SharedRng);
-    public static PlanetPalette MakeStandard() => MakeStandard(SharedRng);
-
-    private static PlanetPalette MakeSterile(Random rng)
+    private static PlanetPalette MakeRandom()
     {
-        var fam = rng.Next(0, 5);
-        float baseH = fam switch
-        {
-            0 => RandRange(rng, 0.02f, 0.08f),
-            1 => RandRange(rng, 0.48f, 0.55f),
-            2 => RandRange(rng, 0.58f, 0.64f),
-            3 => RandRange(rng, 0.20f, 0.25f),
-            _ => RandRange(rng, 0.78f, 0.85f)
-        };
-        var baseS = RandRange(rng, 0.55f, 0.75f);
-        var baseV = RandRange(rng, 0.55f, 0.72f);
-        var @base = ColorFromHsv(baseH, baseS, baseV);
-        var plains = CapSvVariant(@base, 0f, -0.02f, 0.00f);
-        var hills = CapSvVariant(@base, 0f, -0.10f, +0.01f);
-        var mountains = CapSvVariant(@base, 0f, +0.06f, -0.02f);
-        var shelfWater = CapSvVariant(@base, 0f, -0.15f, +0.05f);
-        var deepWater = CapSvVariant(@base, 0f, -0.25f, +0.08f);
-        return new PlanetPalette(
-            deepWater, shelfWater,
-            Beach: new Color(0.5f, 0.45f, 0.4f),
-            plains, hills, mountains,
-            HasBeaches: false);
+        var seed = Random.Shared.Next();
+        return Make(PlanetEnvironment.Generate(seed), seed);
     }
 
-    private static PlanetPalette MakeOceanic(Random rng)
+    private static Color Hsv(float h, float s, float v)
     {
-        var baseH = RandRange(rng, 0f, 1f);
-        var baseS = RandRange(rng, 0.35f, 0.7f);
-        var baseV = RandRange(rng, 0.45f, 0.8f);
-        var landBase = ColorFromHsv(baseH, baseS, baseV);
-        var plains = Variant(landBase, 0f, -0.02f, 0f);
-        var hills = Variant(landBase, 0f, -0.08f, +0.02f);
-        var mountains = Variant(landBase, 0f, +0.10f, -0.05f);
-        var oceanFamilies = new[]
-        {
-            new[] { ColorFromRgb(124, 193, 165), ColorFromRgb(112, 170, 130) },
-            new[] { ColorFromRgb(124, 193, 219), ColorFromRgb(112, 170, 196) }
-        };
-        var choice = oceanFamilies[rng.Next(oceanFamilies.Length)];
-        var shelfWater = choice[0];
-        var deepWater = choice[1];
-        return new PlanetPalette(
-            deepWater, shelfWater,
-            Beach: new Color(0.95f, 0.9f, 0.55f),
-            Plains: plains,
-            Hills: hills,
-            Mountains: mountains,
-            HasBeaches: true);
-    }
-
-    private static PlanetPalette MakeStandard(Random rng) => MakeSterile(rng);
-
-    private static float RandRange(Random rng, float min, float max) => (float)(min + (max - min) * rng.NextDouble());
-    private static Color ColorFromRgb(int r, int g, int b) => new(r / 255f, g / 255f, b / 255f);
-
-    private static int HashSeed(int seed, PlanetPaletteType type)
-    {
-        unchecked
-        {
-            const int golden = unchecked((int)0x9E3779B9);
-            const int mix = unchecked((int)0x85EBCA6B);
-            var h = seed ^ golden;
-            h ^= ((int)type + 1) * mix;
-            h ^= h << 13;
-            h ^= h >> 17;
-            h ^= h << 5;
-            return h == 0 ? 1 : h;
-        }
-    }
-
-    private static Color ColorFromHsv(float h, float s, float v)
-    {
-        var hh = h * 6f;
+        h = (h - MathF.Floor(h)) * 6f;
+        s = Math.Clamp(s, 0f, 0.8f);
+        v = Math.Clamp(v, 0.25f, 1f);
         var c = v * s;
-        var x = c * (1f - MathF.Abs(hh % 2f - 1f));
+        var x = c * (1f - MathF.Abs(h % 2f - 1f));
         var m = v - c;
-        float rf, gf, bf;
-        if (hh < 1) (rf, gf, bf) = (c, x, 0);
-        else if (hh < 2) (rf, gf, bf) = (x, c, 0);
-        else if (hh < 3) (rf, gf, bf) = (0, c, x);
-        else if (hh < 4) (rf, gf, bf) = (0, x, c);
-        else if (hh < 5) (rf, gf, bf) = (x, 0, c);
-        else (rf, gf, bf) = (c, 0, x);
-        return new Color(rf + m, gf + m, bf + m);
-    }
-
-    private static Color Variant(Color b, float dh, float dv, float ds = 0f)
-    {
-        ToHsv(b, out var h, out var s, out var v);
-        return ColorFromHsv(h + dh, s + ds, v + dv);
-    }
-
-    private static Color CapSvVariant(Color b, float dh, float dv, float ds = 0f)
-    {
-        ToHsv(b, out var h, out var s, out var v);
-        return ColorFromHsv(h + dh, Math.Clamp(s + ds, 0f, 1f), Math.Clamp(v + dv, 0f, 1f));
-    }
-
-    private static void ToHsv(Color c, out float h, out float s, out float v)
-    {
-        var rf = c.R / 255f;
-        var gf = c.G / 255f;
-        var bf = c.B / 255f;
-        var max = MathF.Max(rf, MathF.Max(gf, bf));
-        var min = MathF.Min(rf, MathF.Min(gf, bf));
-        var delta = max - min;
-        if (delta < 1e-6f) h = 0f;
-        else if (max == rf) h = ((gf - bf) / delta) % 6f;
-        else if (max == gf) h = (bf - rf) / delta + 2f;
-        else h = (rf - gf) / delta + 4f;
-        h /= 6f;
-        if (h < 0) h += 1f;
-        s = max < 1e-6f ? 0f : delta / max;
-        v = max;
+        var rgb = h switch
+        {
+            < 1f => new Vector3(c, x, 0f),
+            < 2f => new Vector3(x, c, 0f),
+            < 3f => new Vector3(0f, c, x),
+            < 4f => new Vector3(0f, x, c),
+            < 5f => new Vector3(x, 0f, c),
+            _ => new Vector3(c, 0f, x)
+        };
+        return new Color(rgb + new Vector3(m));
     }
 }

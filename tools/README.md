@@ -24,14 +24,14 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools/Test-Visuals.ps1 -Gala
 ```
 
 `-GalaxyBaseline -SkipBuild -BinaryDirectory <dossier>` capture uniquement la
-galaxie d'un ancien binaire. `galaxy-world-baseline.txt` conserve les positions,
+galaxie d'un binaire compatible. `galaxy-world-baseline.txt` conserve les positions,
 graines et classes mesurées avant la refonte : ces identités restent vérifiées
 même lorsque l'habillage visuel change.
 
 `-PlanetRestoreOnly` capture les trois planètes de référence et leurs atlas bruts
 (codes de relief et couleurs), puis contrôle la rotation, les anneaux, les lunes
 et la sélection. Combiné à `-SkipBuild -BinaryDirectory <dossier>`, ce mode permet
-de comparer la génération à une ancienne version compilée. Le mode normal
+de réutiliser une version compilée compatible avec les API du banc. Le mode normal
 contrôle aussi la conservation des réglages de terrain entre deux systèmes.
 
 `-SystemOnly` contrôle les soleils, les fonds et la grille de 2 × 2 pixels des
@@ -56,3 +56,28 @@ même graine de soleil et même instant, avec une température solaire de 3 200 
 captures de jour et de nuit doivent montrer l'évolution de la palette.
 
 La fenêtre reste cachée dès sa création : le moteur MonoGame 3.8.4.1 crée ses fenêtres avec le drapeau `Hidden` dans [SDLGameWindow](https://github.com/MonoGame/MonoGame/blob/v3.8.4.1/MonoGame.Framework/Platform/SDL/SDLGameWindow.cs), et les affiche uniquement dans la boucle `RunLoop` de [SDLGamePlatform](https://github.com/MonoGame/MonoGame/blob/v3.8.4.1/MonoGame.Framework/Platform/SDL/SDLGamePlatform.cs). Le banc vérifie les drapeaux SDL avant et après les captures.
+
+## Planètes systémiques
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/Test-Visuals.ps1 -PlanetSystemicOnly -OutputDirectory artifacts/planet-systemic
+```
+
+Ce mode utilise `PlanetSystemicReview.cs.txt` en complément du banc principal. Il vérifie :
+
+- la normalisation déterministe des caractéristiques et de la composition ;
+- les cellules, couleurs et coordonnées sphériques, les pôles et la longitude bouclée ;
+- 18 graines consécutives sans sélection et la variation géographique à environnement identique ;
+- les relations température / orbite / latitude et les mélanges eau, glace et volcanisme ;
+- les rivières, les cratères, les mondes sans atmosphère et l'absence de neige globale sans réserve d'eau ;
+- l'absence de liquide, glace et débit fluvial pour une réserve d'eau nulle ;
+- les caches, la propagation des modifications jusqu'au vrai renderer et l'indépendance aux tailles d'affichage ;
+- la rotation GPU exacte, les contrôles F3 et la conservation des éditions Sea / Milieu → Eau après navigation.
+
+Les atlas canoniques font 256 × 128 cellules ; le rapport mesure leur temps de génération. La planche de 30 globes est rendue en GPU avec la même lumière, les nuages actifs et les anneaux/lunes masqués. Les 18 premières graines sont suivies de 12 variations contrôlées d'une même graine. Les légendes W/A/V représentent la **réserve d'eau**, l'intensité atmosphérique et l'activité volcanique ; W n'est pas la fraction visible d'océan liquide.
+
+Les sorties sont `planet-systemic-contact-sheet.png`, les 30 images individuelles, `planet-systemic-gallery.html`, `planet-systemic-manifest.json` (environnements et décomptes de cellules par terrain), et `report.txt`. Les moyennes locales et décomptes portent sur les cellules de l'atlas UV, sans pondération par leur surface sphérique ; les cellules proches des pôles couvrent moins de surface physique. La température moyenne de l'environnement reste le paramètre global du modèle.
+
+La génération suit les étapes géologie → niveau des mers pondéré par la surface sphérique → climat local → drainage et érosion des chenaux → classification/couleurs/nuages. Seuls les champs finaux sont conservés dans l'atlas. Pour étendre le système, voir le [README du projet](../README.md#genération-systémique-des-planètes) : une nouvelle caractéristique possède une unité et un canal déterministe, et un nouveau terrain doit être ajouté à l'enum, à la classification et à la palette.
+
+`-SkipBuild -BinaryDirectory <dossier>` demande une assembly compatible avec les API actuelles du banc, y compris `PlanetEnvironment` et `PlanetSurfaceCell`. Pour comparer à une version antérieure à cette refonte, utiliser le script et les sources de validation de cette version avec son binaire, puis comparer les captures exportées.

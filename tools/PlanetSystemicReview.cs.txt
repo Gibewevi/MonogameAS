@@ -1,0 +1,405 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using MonogameAS;
+using MonogameAS.Planet;
+using MonogameAS.State;
+using MonogameAS.Systems;
+
+// Behavioral checks and real GPU captures; compiled only by Test-Visuals.ps1.
+internal static partial class Program
+{
+    private static void ValidateSystemicPlanets(GraphicsDevice device, RenderContext context,
+        string output, List<string> report)
+    {
+        var fixtures = PlanetFixtures();
+        ValidateEnvironmentNormalization(report);
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        var worlds = fixtures.Select(f => new PlanetWorldMap(f.Key)).ToArray();
+        timer.Stop();
+        report.Add($"Generated {worlds.Length} canonical atlases in {timer.Elapsed.TotalMilliseconds:0} ms ({timer.Elapsed.TotalMilliseconds / worlds.Length:0.0} ms/world).");
+        ValidateSystemicDeterminism(fixtures, worlds, report);
+        ValidateSystemicConditions(fixtures, worlds, report);
+        ValidateSystemicCacheAndScale(fixtures[0].Key, device, report);
+        ValidateSystemicOrbits(report);
+        CaptureSystemicContactSheet(device, context, fixtures, worlds, output, report);
+    }
+
+    private static (string Label, PlanetKey Key)[] PlanetFixtures()
+    {
+        var fixtures = new List<(string, PlanetKey)>();
+        // Consecutive, unfiltered seeds expose the distribution produced by the generator.
+        for (var seed = 1000; seed < 1018; seed++)
+            fixtures.Add(($"Seed {seed}", new PlanetKey(seed, PlanetPaletteType.Standard, PlanetParams.Default)));
+        var reference = new PlanetEnvironment
+        {
+            OrbitalDistanceAu = 1f, StellarLuminosity = 1f, Atmosphere = .8f,
+            Greenhouse = .35f, Water = .62f, Salinity = .25f,
+            Volcanism = .35f, Tectonics = .65f, AgeGyr = 4f, Impacts = .3f,
+            Erosion = .45f, AxialTilt = 23.5f, Iron = .3f, Silicates = .65f,
+            Carbon = .25f, LifePotential = .75f, ContinentalScale = 2.1f, Relief = .6f
+        };
+        void Add(string name, PlanetEnvironment environment, int seed = 8721) =>
+            fixtures.Add((name, new PlanetKey(seed, PlanetPaletteType.Standard, PlanetParams.Default) { Environment = environment }));
+        Add("Reference", reference);
+        Add("Same seed / warmer", reference with { OrbitalDistanceAu = .76f });
+        Add("Same seed / colder", reference with { OrbitalDistanceAu = 1.42f });
+        Add("Airless / volatile-rich", reference with { Atmosphere = 0, Greenhouse = 0, LifePotential = 0 });
+        Add("Dry / eroded / old", reference with { Water = .025f, AgeGyr = 9f, Erosion = .95f, Volcanism = .025f, LifePotential = 0 });
+        Add("Young / active / wet", reference with { AgeGyr = .15f, Volcanism = .95f, Tectonics = .95f, Water = .68f, LifePotential = .05f });
+        Add("Cold / active / saline", reference with { OrbitalDistanceAu = 1.2f, AgeGyr = .4f, Volcanism = .94f, Tectonics = .9f, Salinity = .9f, Water = .7f, LifePotential = .2f });
+        Add("Ocean / low relief", reference with { Water = .93f, Relief = .22f, ContinentalScale = 3.6f });
+        Add("Impacts / dry / airless", reference with { Atmosphere = 0, Water = .02f, Impacts = .95f, AgeGyr = 7f, Erosion = .02f, Volcanism = .02f, LifePotential = 0 });
+        Add("Iron / high mountains", reference with { Iron = .95f, Silicates = .3f, Relief = .95f, Water = .36f, Tectonics = .9f });
+        Add("Carbon / wet lowlands", reference with { Carbon = .95f, Iron = .1f, Water = .77f, Relief = .4f, LifePotential = .9f });
+        Add("Hot / forming crust", reference with { OrbitalDistanceAu = .57f, AgeGyr = .03f, Volcanism = .99f, Water = .13f, LifePotential = 0 });
+        return fixtures.ToArray();
+    }
+
+    private static void ValidateSystemicDeterminism((string Label, PlanetKey Key)[] fixtures,
+        PlanetWorldMap[] worlds, List<string> report)
+    {
+        var fingerprints = new HashSet<ulong>();
+        var allTerrain = new HashSet<PlanetTerrain>();
+        var localColorVariation = false;
+        for (var i = 0; i < worlds.Length; i++)
+        {
+            var map = worlds[i];
+            var repeat = i is 0 or 18 ? new PlanetWorldMap(fixtures[i].Key) : null;
+            var fingerprint = 14695981039346656037UL;
+            var colorsByTerrain = new Dictionary<PlanetTerrain, HashSet<uint>>();
+            for (var y = 0; y < map.Height; y++)
+            for (var x = 0; x < map.Width; x++)
+            {
+                var u = (x + .37f) / map.Width;
+                var v = (y + .37f) / map.Height;
+                var cell = map.SampleCellUv(u, v);
+                var color = map.SampleColorUv(u, v);
+                Check(Enum.IsDefined(cell.Terrain), "Undefined terrain classification.");
+                Check(map.SampleUv(u, v) == (int)cell.Terrain, "Surface-code and cell samplers disagree.");
+                Check(float.IsFinite(cell.Elevation) && float.IsFinite(cell.TemperatureC)
+                    && float.IsFinite(cell.Moisture) && float.IsFinite(cell.Geothermal)
+                    && float.IsFinite(cell.River) && float.IsFinite(cell.Crater), "Non-finite environmental sample.");
+                Check(color.A == 255, "Local palette contains a transparent surface cell.");
+                allTerrain.Add(cell.Terrain);
+                if (!colorsByTerrain.TryGetValue(cell.Terrain, out var terrainColors))
+                    colorsByTerrain[cell.Terrain] = terrainColors = new HashSet<uint>();
+                terrainColors.Add(color.PackedValue);
+                fingerprint = unchecked((fingerprint ^ color.PackedValue ^ (uint)cell.Terrain) * 1099511628211UL);
+                if (repeat != null)
+                {
+                    Check(cell.Equals(repeat.SampleCellUv(u, v)), "Same key generated different environmental cells.");
+                    Check(color == repeat.SampleColorUv(u, v), "Same key generated different local colors.");
+                }
+                // Interior texel coordinates avoid floating-point ambiguity at exact texel edges.
+                if (x % 11 != 0 || y % 7 != 0) continue;
+                foreach (var turns in new[] { -4f, -1f, 1f, 4f })
+                {
+                    Check(cell.Equals(map.SampleCellUv(u + turns, v)), "Cell sampler failed longitude wrapping.");
+                    Check(color == map.SampleColorUv(u + turns, v), "Color sampler failed longitude wrapping.");
+                }
+                var longitude = (u - .5f) * MathHelper.TwoPi;
+                var latitude = (.5f - v) * MathHelper.Pi;
+                Check(cell.Equals(map.SampleCell(longitude, latitude)), "Spherical and UV cell samplers disagree.");
+                Check(color == map.SampleColor(longitude, latitude), "Spherical and UV local colors disagree.");
+            }
+            foreach (var terrain in Enum.GetValues<PlanetTerrain>())
+                Check(map.ColorFor((int)terrain).A == 255, $"Missing opaque palette entry for {terrain}.");
+            foreach (var latitude in new[] { -MathHelper.PiOver2, MathHelper.PiOver2 })
+                for (var x = -12; x <= 12; x++)
+                    Check(map.SampleColor(x * 1.13f, latitude).A == 255, "Invalid polar color.");
+            if (i < 18) fingerprints.Add(fingerprint);
+            localColorVariation |= colorsByTerrain.Values.Any(colors => colors.Count >= 3);
+        }
+        Check(fingerprints.Count == 18, "Consecutive seeds produced duplicate planet appearances.");
+        Check(allTerrain.Count >= 12, $"Only {allTerrain.Count} surface features appeared across the fixture set.");
+        Check(localColorVariation, "Palette colors do not vary with local conditions inside any biome.");
+        var reference = worlds[18];
+        var changedSeed = new PlanetWorldMap(fixtures[18].Key with { Seed = fixtures[18].Key.Seed + 7919 });
+        var geographyChanges = 0;
+        for (var y = 0; y < 32; y++)
+        for (var x = 0; x < 64; x++)
+        {
+            var u = (x + .5f) / 64;
+            var v = (y + .5f) / 32;
+            if (MathF.Abs(reference.SampleCellUv(u, v).Elevation - changedSeed.SampleCellUv(u, v).Elevation) > .02f)
+                geographyChanges++;
+        }
+        Check(geographyChanges > 100, "Changing only the seed does not change geography.");
+        report.Add($"PASS: 18 unfiltered seeds have unique atlas fingerprints; {allTerrain.Count} terrain features across 30 worlds; exact cell/color determinism, UV/radian agreement, full negative/positive longitude wrapping, finite fields, opaque local colors and all terrain palette entries.");
+        report.Add("Observed terrain features: " + string.Join(", ", allTerrain.OrderBy(t => (int)t)));
+        report.Add($"PASS: changing only the seed changes {geographyChanges}/2048 sampled elevations; local conditions produce several quantized colors within a biome.");
+    }
+
+    private static void ValidateEnvironmentNormalization(List<string> report)
+    {
+        var invalid = new PlanetEnvironment
+        {
+            OrbitalDistanceAu = float.NaN, StellarLuminosity = float.PositiveInfinity,
+            Water = -3, Atmosphere = 8, AgeGyr = float.NegativeInfinity,
+            AxialTilt = 120, ContinentalScale = 0, Iron = 0, Silicates = 0, Carbon = 0
+        }.Normalized();
+        Check(float.IsFinite(invalid.MeanTemperatureC) && float.IsFinite(invalid.LiquidWaterPotential),
+            "Malformed inputs created non-finite climate outputs.");
+        Check(invalid.Water == 0 && invalid.Atmosphere == 1 && invalid.AxialTilt <= 90
+            && invalid.OrbitalDistanceAu > 0 && invalid.AgeGyr > 0 && invalid.ContinentalScale > 0,
+            "Environment normalization failed physical bounds.");
+        for (var seed = 0; seed < 256; seed++)
+        {
+            var environment = PlanetEnvironment.Generate(seed);
+            Check(environment == environment.Normalized() && environment == PlanetEnvironment.Generate(seed),
+                "Environment generation/normalization is not stable and deterministic.");
+            Check(MathF.Abs(environment.Iron + environment.Silicates + environment.Carbon - 1) < .00001f,
+                "Mineral composition does not sum to one.");
+        }
+        report.Add("PASS: bounded finite normalization of malformed inputs; 256 generated environments are deterministic, normalization-stable, and have normalized mineral composition.");
+    }
+
+    private static void ValidateSystemicConditions((string Label, PlanetKey Key)[] fixtures,
+        PlanetWorldMap[] worlds, List<string> report)
+    {
+        var reference = worlds[18];
+        var warm = worlds[19];
+        var cold = worlds[20];
+        var airless = worlds[21];
+        var warmStats = SurfaceStatistics(warm);
+        var coldStats = SurfaceStatistics(cold);
+        Check(warm.Environment.MeanTemperatureC > cold.Environment.MeanTemperatureC + 20,
+            "Increased stellar flux did not raise the mean temperature.");
+        Check(warmStats.MeanTemperature > coldStats.MeanTemperature + 20,
+            "Orbital climate did not reach the local temperature field.");
+        Check(coldStats.Frozen > warmStats.Frozen, "Moving the same seeded world farther out did not increase frozen terrain.");
+        var equatorial = 0d;
+        var polar = 0d;
+        var equatorialCount = 0;
+        var polarCount = 0;
+        for (var y = 0; y < reference.Height; y++)
+        for (var x = 0; x < reference.Width; x++)
+        {
+            var v = (y + .5f) / reference.Height;
+            var temperature = reference.SampleCellUv((x + .5f) / reference.Width, v).TemperatureC;
+            if (v is > .4f and < .6f) { equatorial += temperature; equatorialCount++; }
+            if (v is < .15f or > .85f) { polar += temperature; polarCount++; }
+        }
+        Check(equatorial / equatorialCount > polar / polarCount + 10, "Latitude did not cool the poles.");
+        Check(SurfaceStatistics(airless).Liquid == 0, "Airless world retains exposed liquid water.");
+        var mixtures = worlds.Select(SurfaceStatistics).ToArray();
+        Check(mixtures.Any(s => s.Liquid > 0 && s.Frozen > 0), "No world combines exposed liquid water and frozen terrain.");
+        Check(mixtures.Any(s => s.Liquid > 0 && s.Volcanic > 0), "No world combines exposed liquid water and volcanic terrain.");
+        Check(mixtures.Any(s => s.Liquid > 0 && s.Frozen > 0 && s.Volcanic > 0),
+            "No world combines liquid water, frozen terrain and active volcanism.");
+        Check(mixtures.Any(s => s.Rivers > 0), "No drainage network produced river terrain.");
+        Check(mixtures.Any(s => s.Craters > 0), "No impact field produced crater terrain.");
+        var dryCold = new PlanetWorldMap(fixtures[18].Key with
+        {
+            Environment = new PlanetEnvironment
+            {
+                OrbitalDistanceAu = 1.7f, Atmosphere = 0, Water = .01f,
+                Volcanism = 0, AgeGyr = 10, Impacts = .9f
+            }
+        });
+        var dryColdStats = SurfaceStatistics(dryCold);
+        Check(dryColdStats.Liquid == 0 && dryColdStats.Rivers == 0 && dryColdStats.Craters > 0,
+            "Cold, almost dry airless terrain should expose craters and no liquid/rivers.");
+        Check(dryColdStats.Frozen < dryCold.Width * dryCold.Height / 4,
+            "Cold temperature created a global snow cover without sufficient water or atmosphere.");
+        var noWater = new PlanetWorldMap(fixtures[18].Key with { Environment = fixtures[18].Key.ResolveEnvironment() with { Water = 0 } });
+        var noWaterStats = SurfaceStatistics(noWater);
+        Check(noWaterStats.Liquid == 0 && noWaterStats.Frozen == 0 && noWaterStats.Rivers == 0,
+            "A zero-water world generated exposed water, frozen water or rivers.");
+        for (var y = 0; y < noWater.Height; y++)
+        for (var x = 0; x < noWater.Width; x++)
+            Check(noWater.SampleCellUv((x + .5f) / noWater.Width, (y + .5f) / noWater.Height).River == 0,
+                "A zero-water world retained hidden river discharge.");
+        report.Add($"PASS: same-seed orbital climate changes local mean temperature {warmStats.MeanTemperature:0.0} -> {coldStats.MeanTemperature:0.0} C and frozen cells {warmStats.Frozen} -> {coldStats.Frozen}; poles are cooler; airless worlds have no exposed liquid; oceans, ice and volcanism coexist; rivers and craters appear.");
+        report.Add($"PASS: dry cold airless world retains exposed terrain ({dryColdStats.Frozen}/{dryCold.Width * dryCold.Height} frozen cells, {dryColdStats.Craters} crater cells); zero-water world has no liquid, ice, snow, rivers or hidden river flow.");
+    }
+
+    private static void ValidateSystemicCacheAndScale(PlanetKey key, GraphicsDevice device, List<string> report)
+    {
+        var cached = PlanetWorldMap.GetOrGenerate(key);
+        Check(ReferenceEquals(cached, PlanetWorldMap.GetOrGenerate(key)), "Identical key failed to reuse its atlas.");
+        var environment = key.ResolveEnvironment();
+        var edited = key with { Environment = environment with { Water = 1f - environment.Water } };
+        Check(key != edited, "Environment edit is absent from planet identity.");
+        var editedMap = PlanetWorldMap.GetOrGenerate(edited);
+        Check(!ReferenceEquals(cached, editedMap), "Environment edit reused a stale cached atlas.");
+        var tinyKey = key with { Params = key.Params with { PlanetRadiusPx = 14, CellSize = 2 } };
+        var largeKey = key with { Params = key.Params with { PlanetRadiusPx = 130, CellSize = 4 } };
+        var tiny = PlanetWorldMap.GetOrGenerate(tinyKey);
+        var large = PlanetWorldMap.GetOrGenerate(largeKey);
+        Check(tiny.Width == large.Width && tiny.Height == large.Height, "Canonical resolution changes with display dimensions.");
+        var legacy = new PlanetWorldMap(key with { Palette = PlanetPaletteType.Sterile });
+        for (var y = 0; y < tiny.Height; y += 3)
+        for (var x = 0; x < tiny.Width; x += 3)
+        {
+            var u = (x + .37f) / tiny.Width;
+            var v = (y + .37f) / tiny.Height;
+            Check(tiny.SampleCellUv(u, v).Equals(large.SampleCellUv(u, v)), "Display size changes a planet's geography/climate.");
+            Check(tiny.SampleColorUv(u, v) == large.SampleColorUv(u, v), "Display size changes local surface colors.");
+            Check(cached.SampleCellUv(u, v).Equals(legacy.SampleCellUv(u, v))
+                && cached.SampleColorUv(u, v) == legacy.SampleColorUv(u, v), "Legacy palette categories still control generation.");
+        }
+        var provider = new PlanetProvider();
+        var first = provider.GetOrGenerate(key, new Point(640, 360));
+        Check(ReferenceEquals(first, provider.GetOrGenerate(key, new Point(640, 360))), "Planet provider recreates unchanged data.");
+        var changed = provider.GetOrGenerate(edited, new Point(640, 360));
+        Check(!ReferenceEquals(first, changed) && changed.World!.Environment == edited.ResolveEnvironment(),
+            "Planet provider failed to propagate environmental edits.");
+        var rendererType = typeof(PlanetWorldMap).Assembly.GetType("MonogameAS.Planet.PixelPlanetRenderer")!;
+        using var renderer = (IDisposable)Activator.CreateInstance(rendererType, device)!;
+        var update = rendererType.GetMethod("Update")!;
+        update.Invoke(renderer, new object[] { key, new Point(640, 360), 0d, Vector3.UnitZ, Color.White, true, false, false, 0, 0 });
+        Check(((PlanetWorldMap)Field(renderer, "_world")).Environment == key.ResolveEnvironment(), "Renderer lost generated environment.");
+        update.Invoke(renderer, new object[] { edited, new Point(640, 360), 0d, Vector3.UnitZ, Color.White, true, false, false, 0, 0 });
+        Check(((PlanetWorldMap)Field(renderer, "_world")).Environment == edited.ResolveEnvironment(), "Renderer retained old environment after key edit.");
+        var airlessKey = key with { Environment = environment with { Atmosphere = 0 } };
+        update.Invoke(renderer, new object[] { airlessKey, new Point(640, 360), 0d, Vector3.UnitZ, Color.White, true, true, false, 0, 0 });
+        Check(((Color[])Field(Field(renderer, "_atmosphere"), "Pixels")).All(color => color.A == 0),
+            "Changing to an airless environment left visible atmospheric halo pixels.");
+        report.Add("PASS: atlas/provider cache reuse, environment-key invalidation through the real renderer, canonical geography/local color independent of display radius/cell size, legacy palette categories have no generation effect.");
+        report.Add("PASS: changing the actual renderer to an airless world clears every atmospheric halo texel; clouds retain their original independent algorithm.");
+    }
+
+    private static void ValidateSystemicOrbits(List<string> report)
+    {
+        var generator = new SystemGenerator();
+        var sun = new SunKey(741, 0, 5778, 12, 4);
+        var system = generator.Generate(741, sun, SystemParams.Default, PlanetParams.Default, PlanetPaletteType.Standard);
+        var repeated = generator.Generate(741, sun, SystemParams.Default, PlanetParams.Default, PlanetPaletteType.Sterile);
+        Check(system.Planets.Count >= 3, "Orbital fixture contains too few planets.");
+        var previousDistance = 0f;
+        float? luminosity = null;
+        for (var i = 0; i < system.Planets.Count; i++)
+        {
+            var planet = system.Planets[i];
+            Check(planet.PlanetKey.Environment.HasValue, "Orbital planet does not persist its stellar environment.");
+            var env = planet.PlanetKey.ResolveEnvironment();
+            Check(env.OrbitalDistanceAu > previousDistance, "Increasing system orbit does not increase environmental distance.");
+            Check(luminosity == null || env.StellarLuminosity == luminosity.Value, "Planets in one system disagree on stellar luminosity.");
+            Check(env == repeated.Planets[i].PlanetKey.ResolveEnvironment(), "System environment is nondeterministic or depends on legacy categories.");
+            previousDistance = env.OrbitalDistanceAu;
+            luminosity = env.StellarLuminosity;
+        }
+        var hotter = generator.Generate(741, sun with { Celsus = 9500 }, SystemParams.Default, PlanetParams.Default, PlanetPaletteType.Standard);
+        Check(hotter.Planets[0].PlanetKey.ResolveEnvironment().StellarLuminosity > luminosity!.Value,
+            "Stellar temperature did not influence the environments of its planets.");
+        report.Add($"PASS: {system.Planets.Count} orbital planets carry deterministic environments; physical distance increases with orbit, all share their star's luminosity, and hotter stellar input increases it.");
+    }
+
+    private static void CaptureSystemicContactSheet(GraphicsDevice device, RenderContext context,
+        (string Label, PlanetKey Key)[] fixtures, PlanetWorldMap[] worlds, string output, List<string> report)
+    {
+        const int tileWidth = 208, tileHeight = 212, columns = 6;
+        var rows = (fixtures.Length + columns - 1) / columns;
+        var images = new List<Texture2D>();
+        var manifest = new List<object>();
+        var rendererType = typeof(PlanetWorldMap).Assembly.GetType("MonogameAS.Planet.PixelPlanetRenderer")!;
+        var update = rendererType.GetMethod("Update")!;
+        var draw = rendererType.GetMethod("Draw")!;
+        using var tile = new RenderTarget2D(device, tileWidth, tileHeight, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+        using var sheet = new RenderTarget2D(device, tileWidth * columns, tileHeight * rows, false, SurfaceFormat.Color,
+            DepthFormat.None, 0, RenderTargetUsage.PreserveContents);
+        try
+        {
+            for (var i = 0; i < fixtures.Length; i++)
+            {
+                var (label, original) = fixtures[i];
+                var key = original with { Params = original.Params with { PlanetRadiusPx = 62, CellSize = 2, CloudCellSize = 2, CloudMargin = 4 } };
+                using var renderer = (IDisposable)Activator.CreateInstance(rendererType, device)!;
+                update.Invoke(renderer, new object[] { key, new Point(208, 160), 0d,
+                    Vector3.Normalize(new Vector3(-.55f, .4f, .75f)), Color.White, true, true, false, 0, 0 });
+                var env = key.ResolveEnvironment();
+                device.SetRenderTarget(tile);
+                device.Clear(new Color(14, 20, 35));
+                context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp, blendState: BlendState.AlphaBlend);
+                draw.Invoke(renderer, new object[] { context.SpriteBatch, context.Pixel });
+                Text(label, 163, new Color(226, 233, 245));
+                Text(FormattableString.Invariant($"{env.MeanTemperatureC:0} C   {env.OrbitalDistanceAu:0.00} AU"), 180, new Color(171, 189, 214));
+                Text(FormattableString.Invariant($"W {env.Water:0.00}   A {env.Atmosphere:0.00}   V {env.Volcanism:0.00}"), 197, new Color(153, 179, 187));
+                context.SpriteBatch.End();
+                device.SetRenderTarget(null);
+                var pixels = new Color[tileWidth * tileHeight];
+                tile.GetData(pixels);
+                Check(pixels.Take(tileWidth * 160).Count(c => c != new Color(14, 20, 35)) > 100,
+                    "Planet renderer produced an empty contact-sheet tile.");
+                var texture = new Texture2D(device, tileWidth, tileHeight);
+                texture.SetData(pixels);
+                images.Add(texture);
+                var file = $"planet-systemic-{i + 1:00}.png";
+                using (var stream = File.Create(Path.Combine(output, file))) tile.SaveAsPng(stream, tileWidth, tileHeight);
+                manifest.Add(new { Index = i + 1, Label = label, original.Seed, Environment = env,
+                    Surface = SurfaceStatistics(worlds[i]), Image = file });
+                void Text(string text, int y, Color color)
+                {
+                    var scale = Math.Min(.65f, 194f / context.Font.MeasureString(text).X);
+                    context.SpriteBatch.DrawString(context.Font, text, new Vector2(7, y), color, 0, Vector2.Zero, scale, SpriteEffects.None, 0);
+                }
+            }
+            device.SetRenderTarget(sheet);
+            device.Clear(new Color(14, 20, 35));
+            context.SpriteBatch.Begin(samplerState: SamplerState.PointClamp);
+            for (var i = 0; i < images.Count; i++)
+                context.SpriteBatch.Draw(images[i], new Vector2(i % columns * tileWidth, i / columns * tileHeight), Color.White);
+            context.SpriteBatch.End();
+            device.SetRenderTarget(null);
+            using (var stream = File.Create(Path.Combine(output, "planet-systemic-contact-sheet.png")))
+                sheet.SaveAsPng(stream, sheet.Width, sheet.Height);
+            File.WriteAllText(Path.Combine(output, "planet-systemic-manifest.json"), JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }));
+            File.WriteAllText(Path.Combine(output, "planet-systemic-gallery.html"), """
+<!doctype html><html lang="fr"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Planètes systémiques — revue visuelle</title><style>
+body{background:#0e1423;color:#e2e9f5;font:16px system-ui;margin:32px auto;padding:0 24px;max-width:1248px}p{line-height:1.6;color:#adbed6}
+img{display:block;width:100%;image-rendering:pixelated}a{color:#a0dccc}</style>
+<h1>Planètes systémiques</h1><p>Les trois premières lignes montrent 18 graines consécutives, sans sélection.
+Les deux dernières font varier les conditions d'une même graine : climat, eau, atmosphère, âge, volcanisme et composition.
+Captures du véritable rendu MonoGame, avec éclairage constant, nuages actifs et sans décorations.
+Les légendes indiquent la température moyenne, la distance orbitale, l'eau (W), l'atmosphère (A) et le volcanisme (V).
+Les exemples contrôlés sont des fixtures de validation, jamais des catégories utilisées par le générateur.</p>
+<p><a href="report.txt">Vérifications</a> · <a href="planet-systemic-manifest.json">Paramètres et mesures de surface</a></p>
+<a href="planet-systemic-contact-sheet.png"><img src="planet-systemic-contact-sheet.png" alt="30 planètes et leurs conditions de génération"></a></html>
+""");
+            report.Add("Captured: planet-systemic-contact-sheet.png (30 actual GPU globe renders), individual labeled tiles, HTML gallery and JSON environments/surface measurements.");
+        }
+        finally { foreach (var texture in images) texture.Dispose(); }
+    }
+
+    private static SurfaceSummary SurfaceStatistics(PlanetWorldMap map)
+    {
+        var terrain = new Dictionary<string, int>();
+        var liquid = 0;
+        var frozen = 0;
+        var volcanic = 0;
+        var rivers = 0;
+        var craters = 0;
+        var sum = 0d;
+        for (var y = 0; y < map.Height; y++)
+        for (var x = 0; x < map.Width; x++)
+        {
+            var cell = map.SampleCellUv((x + .5f) / map.Width, (y + .5f) / map.Height);
+            var name = cell.Terrain.ToString();
+            terrain[name] = terrain.GetValueOrDefault(name) + 1;
+            if (cell.Terrain is PlanetTerrain.DeepWater or PlanetTerrain.ShelfWater or PlanetTerrain.River) liquid++;
+            if (cell.Terrain is PlanetTerrain.Snow or PlanetTerrain.Ice or PlanetTerrain.Glacier) frozen++;
+            if (cell.Terrain is PlanetTerrain.Lava or PlanetTerrain.LavaHot) volcanic++;
+            if (cell.Terrain == PlanetTerrain.River) rivers++;
+            if (cell.Terrain is PlanetTerrain.CraterFloor or PlanetTerrain.CraterRim) craters++;
+            sum += cell.TemperatureC;
+        }
+        return new SurfaceSummary(sum / (map.Width * map.Height), liquid, frozen, volcanic, rivers, craters, terrain);
+    }
+
+    private sealed record SurfaceSummary(double MeanTemperature, int Liquid, int Frozen, int Volcanic,
+        int Rivers, int Craters, Dictionary<string, int> Terrain);
+    private static void Check(bool condition, string message)
+    {
+        if (!condition) throw new Exception("Systemic planets: " + message);
+    }
+}

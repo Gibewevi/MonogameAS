@@ -20,6 +20,7 @@ public sealed class PlanetGenerator
         var radius = Math.Max(cell, Math.Min(p.PlanetRadiusPx, maximum) / cell * cell);
         var width = radius * 2 / cell;
         var surface = new int[width, width];
+        var surfaceColors = new Color[width, width];
         for (var y = 0; y < width; y++)
         {
             for (var x = 0; x < width; x++)
@@ -32,15 +33,17 @@ public sealed class PlanetGenerator
                     surface[y, x] = -1;
                     continue;
                 }
-                surface[y, x] = clipToCircle
-                    ? world.Sample(MathF.Atan2(nx, MathF.Sqrt(Math.Max(0, 1 - square))), MathF.Asin(-ny))
-                    : world.SampleUv((x + 0.5f) / width, (y + 0.5f) / width);
+                var longitude = clipToCircle ? MathF.Atan2(nx, MathF.Sqrt(Math.Max(0, 1 - square))) : nx * MathHelper.Pi;
+                var latitude = clipToCircle ? MathF.Asin(-ny) : -ny * MathHelper.PiOver2;
+                surface[y, x] = world.Sample(longitude, latitude);
+                surfaceColors[y, x] = world.SampleColor(longitude, latitude);
             }
         }
         var clouds = GenerateCloudsFrame(key, radius, viewport, Vector2.Zero, clipToCircle);
         return new PlanetData
         {
             SurfaceCodes = surface,
+            SurfaceColors = surfaceColors,
             CloudCodes = clouds.Grid,
             Palette = world.Palette,
             World = world,
@@ -59,9 +62,9 @@ public sealed class PlanetGenerator
         };
     }
 
-    /// <summary>Legacy family hint; new callers should supply the complete key.</summary>
+    /// <summary>Compatibility overload. Environment and colors now emerge from the seed.</summary>
     public PlanetData Generate(int seed, PlanetParams parameters, PlanetPalette palette, Point viewport, bool clipToCircle = true) =>
-        Generate(new PlanetKey(seed, palette.HasBeaches ? PlanetPaletteType.Oceanic : PlanetPaletteType.Sterile, parameters), viewport, clipToCircle);
+        Generate(new PlanetKey(seed, PlanetPaletteType.Standard, parameters), viewport, clipToCircle);
 
     public static CloudFrame GenerateCloudsFrame(int seed, PlanetParams parameters, int radiusPx, Point viewport, Vector2 cloudOffset, bool clipToCircle = true) =>
         GenerateCloudsFrame(new PlanetKey(seed, PlanetPaletteType.Standard, parameters), radiusPx, viewport, cloudOffset, clipToCircle);

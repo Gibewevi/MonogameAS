@@ -4,7 +4,8 @@ namespace MonogameAS.Planet;
 
 public sealed class PlanetData
 {
-    public required int[,] SurfaceCodes { get; init; }   // 10/11/12/13/20/21, -1 outside the disc
+    public required int[,] SurfaceCodes { get; init; }   // PlanetTerrain values, -1 outside the disc
+    public Color[,] SurfaceColors { get; init; } = new Color[0, 0]; // Local composition, climate and relief tones
     public required int[,] CloudCodes { get; init; }     // 0/50/51
     public required PlanetPalette Palette { get; init; }
     public PlanetWorldMap? World { get; init; }
